@@ -1,0 +1,11 @@
+# WatchList Backend — Python 3.11+
+fastapi==0.111.0
+uvicorn[standard]==0.29.0
+motor==3.4.0          # async MongoDB driver
+pymongo==4.7.2
+python-jose[cryptography]==3.3.0   # JWT
+passlib[bcrypt]==1.7.4
+httpx==0.27.0         # async HTTP (metadata fetch)
+python-dotenv==1.0.1
+pydantic==2.7.1
+python-multipart==0.0.9
