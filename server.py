@@ -350,6 +350,69 @@ async def delete_link(link_id: str, user=Depends(get_current_user)):
     return {"ok": True}
 
 # ─── METADATA FETCH ──────────────────────────────────────────────────────────
+
+# ═══════════════════════════════════════════════════════════════
+# NOTES ENDPOINTS
+# ═══════════════════════════════════════════════════════════════
+
+class NoteBody(BaseModel):
+    title: str
+    content: str = ""
+    priority: int = 4          # 1=alta, 4=sem
+    dueDate: Optional[str] = None
+    linkedItemId: Optional[str] = None
+    tags: list = []
+    folderName: Optional[str] = None
+    isCompleted: bool = False
+
+@app.get("/api/notes")
+async def get_notes(user=Depends(get_current_user)):
+    uid = str(user["_id"])
+    cursor = db.notes.find({"userId": uid, "deletedAt": None}).sort("updatedAt", -1)
+    notes = await cursor.to_list(None)
+    return [serialize(n) for n in notes]
+
+@app.post("/api/notes")
+async def create_note(body: NoteBody, user=Depends(get_current_user)):
+    uid = str(user["_id"])
+    now = datetime.utcnow()
+    doc = {
+        "userId": uid,
+        "title": body.title or "Sem título",
+        "content": body.content,
+        "priority": body.priority,
+        "dueDate": body.dueDate,
+        "linkedItemId": body.linkedItemId,
+        "tags": body.tags,
+        "folderName": body.folderName,
+        "isCompleted": body.isCompleted,
+        "createdAt": now,
+        "updatedAt": now,
+        "deletedAt": None,
+    }
+    result = await db.notes.insert_one(doc)
+    return {"noteId": str(result.inserted_id)}
+
+@app.patch("/api/notes/{note_id}")
+async def update_note(note_id: str, body: dict, user=Depends(get_current_user)):
+    uid = str(user["_id"])
+    body["updatedAt"] = datetime.utcnow()
+    body.pop("_id", None); body.pop("id", None)
+    await db.notes.update_one(
+        {"_id": ObjectId(note_id), "userId": uid},
+        {"$set": body}
+    )
+    return {"ok": True}
+
+@app.delete("/api/notes/{note_id}")
+async def delete_note(note_id: str, user=Depends(get_current_user)):
+    uid = str(user["_id"])
+    await db.notes.update_one(
+        {"_id": ObjectId(note_id), "userId": uid},
+        {"$set": {"deletedAt": datetime.utcnow()}}
+    )
+    return {"ok": True}
+
 @app.post("/api/fetch-metadata")
 async def fetch_metadata(body: dict):
     """Fetch title + thumbnail for any URL (bypasses CORS for frontend)."""
@@ -514,6 +577,99 @@ async def migration_status(user=Depends(get_current_user)):
             await db.links.count_documents({"userId": str(user["_id"])}) == 0
         )
     }
+
+# ─── NOTES ─────────────────────────────────────────────────────────────────────
+
+class NoteCreate(BaseModel):
+    title: str
+    content: str = ""
+    folder_id: Optional[str] = None
+    linked_item_id: Optional[str] = None
+    priority: int = 4
+    tags: List[str] = []
+    due_date: Optional[str] = None
+
+class NoteUpdate(BaseModel):
+    title: Optional[str] = None
+    content: Optional[str] = None
+    folder_id: Optional[str] = None
+    linked_item_id: Optional[str] = None
+    priority: Optional[int] = None
+    tags: Optional[List[str]] = None
+    due_date: Optional[str] = None
+    is_archived: Optional[bool] = None
+
+class NoteFolderCreate(BaseModel):
+    name: str
+    parent_id: Optional[str] = None
+
+@app.get("/api/notes")
+async def get_notes(folder: str = None, user=Depends(get_current_user)):
+    uid = str(user["_id"])
+    query = {"userId": uid, "deleted_at": None}
+    if folder == "inbox":    query["folder_id"] = None
+    elif folder == "today":
+        from datetime import date
+        query["due_date"] = date.today().isoformat()
+    elif folder and folder not in ("all",):
+        query["folder_id"] = folder
+    notes = await db.notes.find(query).sort("updated_at", -1).to_list(None)
+    return [serialize(n) for n in notes]
+
+@app.post("/api/notes")
+async def create_note(body: NoteCreate, user=Depends(get_current_user)):
+    uid = str(user["_id"])
+    doc = {
+        "userId": uid, "title": body.title, "content": body.content,
+        "folder_id": body.folder_id, "linked_item_id": body.linked_item_id,
+        "priority": body.priority, "tags": body.tags, "due_date": body.due_date,
+        "is_archived": False, "deleted_at": None,
+        "created_at": datetime.utcnow(), "updated_at": datetime.utcnow(),
+    }
+    result = await db.notes.insert_one(doc)
+    return {"noteId": str(result.inserted_id)}
+
+@app.patch("/api/notes/{note_id}")
+async def update_note(note_id: str, body: NoteUpdate, user=Depends(get_current_user)):
+    uid = str(user["_id"])
+    upd = {k: v for k, v in body.dict().items() if v is not None}
+    upd["updated_at"] = datetime.utcnow()
+    await db.notes.update_one({"_id": ObjectId(note_id), "userId": uid}, {"$set": upd})
+    return {"ok": True}
+
+@app.delete("/api/notes/{note_id}")
+async def delete_note(note_id: str, user=Depends(get_current_user)):
+    uid = str(user["_id"])
+    await db.notes.update_one(
+        {"_id": ObjectId(note_id), "userId": uid},
+        {"$set": {"deleted_at": datetime.utcnow()}}
+    )
+    return {"ok": True}
+
+@app.get("/api/notes/folders")
+async def get_note_folders(user=Depends(get_current_user)):
+    uid = str(user["_id"])
+    folders = await db.note_folders.find({"userId": uid}).to_list(None)
+    return [serialize(f) for f in folders]
+
+@app.post("/api/notes/folders")
+async def create_note_folder(body: NoteFolderCreate, user=Depends(get_current_user)):
+    uid = str(user["_id"])
+    doc = {"userId": uid, "name": body.name, "parent_id": body.parent_id,
+           "created_at": datetime.utcnow()}
+    result = await db.note_folders.insert_one(doc)
+    return {"folderId": str(result.inserted_id)}
+
+@app.delete("/api/notes/folders/{folder_id}")
+async def delete_note_folder(folder_id: str, user=Depends(get_current_user)):
+    uid = str(user["_id"])
+    await db.notes.update_many(
+        {"userId": uid, "folder_id": folder_id},
+        {"$set": {"folder_id": None}}
+    )
+    await db.note_folders.delete_one({"_id": ObjectId(folder_id), "userId": uid})
+    return {"ok": True}
+
 
 @app.on_event("startup")
 async def startup():
