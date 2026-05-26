@@ -250,8 +250,10 @@ async def delete_category(cat_id: str, user=Depends(get_current_user)):
         children = await db.categories.find(query_filter).to_list(None)
         for child in children:
             await delete_recursive(str(child["_id"]))
-        # Delete links that belonged to this category
-        await db.links.delete_many({"userId": uid, "categoryId": cid})
+        # NOTE: Links are NOT deleted when category is deleted
+        # They become orphaned and appear in "Sem Categoria" row in the app
+        # This prevents accidental data loss
+        # await db.links.delete_many({"userId": uid, "categoryId": cid})  # intentionally commented out
         # Attempt 1: standard _id + userId match
         try:
             r = await db.categories.delete_one({"_id": ObjectId(cid), "userId": uid})
