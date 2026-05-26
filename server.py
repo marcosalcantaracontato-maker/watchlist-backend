@@ -241,16 +241,32 @@ async def update_category(cat_id: str, body: CategoryUpdate, user=Depends(get_cu
 @app.delete("/api/categories/{cat_id}")
 async def delete_category(cat_id: str, user=Depends(get_current_user)):
     uid = str(user["_id"])
-    # Cascade: delete subcategories and their links
+    deleted_count = 0
+
     async def delete_recursive(cid: str):
-        children = await db.categories.find({"userId": uid, "parentId": cid}).to_list(None)
+        nonlocal deleted_count
+        # Find children — also check parentId stored as ObjectId (legacy)
+        children = await db.categories.find({
+            "userId": uid,
+            "$or": [{"parentId": cid}, {"parentId": ObjectId(cid) if len(cid)==24 else cid}]
+        }).to_list(None)
         for child in children:
             await delete_recursive(str(child["_id"]))
+        # Delete links in this category
         await db.links.delete_many({"userId": uid, "categoryId": cid})
-        await db.categories.delete_one({"_id": ObjectId(cid), "userId": uid})
-    
+        # Try delete by _id as ObjectId (normal case)
+        try:
+            result = await db.categories.delete_one({"_id": ObjectId(cid), "userId": uid})
+            deleted_count += result.deleted_count
+        except Exception:
+            pass
+        # Fallback: delete by id field stored as string (edge case)
+        if deleted_count == 0:
+            result = await db.categories.delete_one({"id": cid, "userId": uid})
+            deleted_count += result.deleted_count
+
     await delete_recursive(cat_id)
-    return {"ok": True}
+    return {"ok": True, "deleted": deleted_count}
 
 @app.put("/api/categories/batch")
 async def batch_update_categories(body: dict, user=Depends(get_current_user)):
