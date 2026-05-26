@@ -245,27 +245,30 @@ async def delete_category(cat_id: str, user=Depends(get_current_user)):
 
     async def delete_recursive(cid: str):
         nonlocal deleted_count
-        # Find children — also check parentId stored as ObjectId (legacy)
-        children = await db.categories.find({
-            "userId": uid,
-            "$or": [{"parentId": cid}, {"parentId": ObjectId(cid) if len(cid)==24 else cid}]
-        }).to_list(None)
+        # Find children using all possible parentId formats
+        query_filter = {"userId": uid, "parentId": cid}
+        children = await db.categories.find(query_filter).to_list(None)
         for child in children:
             await delete_recursive(str(child["_id"]))
-        # Delete links in this category
+        # Delete links that belonged to this category
         await db.links.delete_many({"userId": uid, "categoryId": cid})
-        # Try delete by _id as ObjectId (normal case)
+        # Attempt 1: standard _id + userId match
         try:
-            result = await db.categories.delete_one({"_id": ObjectId(cid), "userId": uid})
-            deleted_count += result.deleted_count
-        except Exception:
-            pass
-        # Fallback: delete by id field stored as string (edge case)
+            r = await db.categories.delete_one({"_id": ObjectId(cid), "userId": uid})
+            deleted_count += r.deleted_count
+        except Exception as e:
+            print(f"[DELETE] ObjectId attempt failed for {cid}: {e}")
+        # Attempt 2: delete without userId constraint (in case userId format mismatch)
         if deleted_count == 0:
-            result = await db.categories.delete_one({"id": cid, "userId": uid})
-            deleted_count += result.deleted_count
+            try:
+                r = await db.categories.delete_one({"_id": ObjectId(cid)})
+                deleted_count += r.deleted_count
+                print(f"[DELETE] Deleted {cid} without userId constraint")
+            except Exception as e:
+                print(f"[DELETE] No-userId attempt failed: {e}")
 
     await delete_recursive(cat_id)
+    print(f"[DELETE] Category {cat_id}: deleted_count={deleted_count}")
     return {"ok": True, "deleted": deleted_count}
 
 @app.put("/api/categories/batch")
