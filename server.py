@@ -124,6 +124,39 @@ class MigrateRequest(BaseModel):
     categories: List[dict]
     links:      List[dict]
 
+# ─── NOTES MODELS ────────────────────────────────────────────────────────────
+class NoteFolderCreate(BaseModel):
+    name:     str
+    parentId: Optional[str] = None
+    color:    Optional[str] = None   # hex color para barra lateral
+    order:    int = 0
+
+class NoteFolderUpdate(BaseModel):
+    name:     Optional[str] = None
+    parentId: Optional[str] = None
+    color:    Optional[str] = None
+    order:    Optional[int] = None
+
+class NoteCreate(BaseModel):
+    title:        Optional[str] = ""
+    body:         Optional[str] = ""       # markdown leve / texto puro
+    folderId:     Optional[str] = None     # null = Caixa de entrada
+    linkedItemId: Optional[str] = None     # vínculo com vídeo salvo
+    priority:     int = 4                  # 1=alta, 4=sem prioridade
+    dueDate:      Optional[str] = None     # ISO string
+    tags:         List[str] = []
+    isCompleted:  bool = False
+
+class NoteUpdate(BaseModel):
+    title:        Optional[str] = None
+    body:         Optional[str] = None
+    folderId:     Optional[str] = None     # passe "__inbox__" para mover para Caixa
+    linkedItemId: Optional[str] = None
+    priority:     Optional[int] = None
+    dueDate:      Optional[str] = None
+    tags:         Optional[List[str]] = None
+    isCompleted:  Optional[bool] = None
+
 # ─── AUTH ROUTES ──────────────────────────────────────────────────────────────
 @app.get("/api/")
 async def root():
@@ -349,70 +382,169 @@ async def delete_link(link_id: str, user=Depends(get_current_user)):
         raise HTTPException(status_code=404, detail="Link não encontrado")
     return {"ok": True}
 
-# ─── METADATA FETCH ──────────────────────────────────────────────────────────
+# ─── NOTE FOLDERS ─────────────────────────────────────────────────────────────
+@app.get("/api/note-folders")
+async def get_note_folders(user=Depends(get_current_user)):
+    cursor = db.note_folders.find({"userId": str(user["_id"])}).sort("order", 1)
+    return [serialize(f) async for f in cursor]
 
-# ═══════════════════════════════════════════════════════════════
-# NOTES ENDPOINTS
-# ═══════════════════════════════════════════════════════════════
+@app.post("/api/note-folders")
+async def create_note_folder(body: NoteFolderCreate, user=Depends(get_current_user)):
+    doc = {
+        "userId":   str(user["_id"]),
+        "name":     body.name.strip() or "Sem nome",
+        "parentId": body.parentId,
+        "color":    body.color,
+        "order":    body.order,
+        "createdAt": datetime.utcnow()
+    }
+    result = await db.note_folders.insert_one(doc)
+    doc["_id"] = result.inserted_id
+    return serialize(doc)
 
-class NoteBody(BaseModel):
-    title: str
-    content: str = ""
-    priority: int = 4          # 1=alta, 4=sem
-    dueDate: Optional[str] = None
-    linkedItemId: Optional[str] = None
-    tags: list = []
-    folderName: Optional[str] = None
-    isCompleted: bool = False
+@app.patch("/api/note-folders/{folder_id}")
+async def update_note_folder(folder_id: str, body: NoteFolderUpdate, user=Depends(get_current_user)):
+    updates = {k: v for k, v in body.dict().items() if v is not None}
+    if not updates:
+        raise HTTPException(status_code=400, detail="Nada para atualizar")
+    result = await db.note_folders.find_one_and_update(
+        {"_id": ObjectId(folder_id), "userId": str(user["_id"])},
+        {"$set": updates},
+        return_document=True
+    )
+    if not result:
+        raise HTTPException(status_code=404, detail="Pasta não encontrada")
+    return serialize(result)
 
-@app.get("/api/notes")
-async def get_notes(user=Depends(get_current_user)):
+@app.delete("/api/note-folders/{folder_id}")
+async def delete_note_folder(folder_id: str, user=Depends(get_current_user)):
+    """
+    Deleta pasta de notas e move todas as notas dela para a Caixa de entrada
+    (folderId = None). Subpastas também são removidas em cascata.
+    """
     uid = str(user["_id"])
-    cursor = db.notes.find({"userId": uid, "deletedAt": None}).sort("updatedAt", -1)
-    notes = await cursor.to_list(None)
-    return [serialize(n) for n in notes]
+    to_delete = [folder_id]
+    queue = [folder_id]
+    while queue:
+        pid = queue.pop()
+        async for child in db.note_folders.find({"userId": uid, "parentId": pid}):
+            cid = str(child["_id"])
+            if cid not in to_delete:
+                to_delete.append(cid)
+                queue.append(cid)
+
+    # Move notas dessas pastas para inbox (folderId = None)
+    await db.notes.update_many(
+        {"userId": uid, "folderId": {"$in": to_delete}},
+        {"$set": {"folderId": None}}
+    )
+    # Remove pastas
+    obj_ids = [ObjectId(x) for x in to_delete]
+    r = await db.note_folders.delete_many({"_id": {"$in": obj_ids}, "userId": uid})
+    return {"ok": True, "deleted": r.deleted_count}
+
+# ─── NOTES ────────────────────────────────────────────────────────────────────
+@app.get("/api/notes")
+async def get_notes(
+    user=Depends(get_current_user),
+    folderId:       Optional[str] = None,    # "__inbox__" filtra só Inbox; "__all__" = tudo
+    includeDeleted: bool = False
+):
+    query: dict = {"userId": str(user["_id"])}
+    if not includeDeleted:
+        query["deletedAt"] = None
+    else:
+        query["deletedAt"] = {"$ne": None}
+
+    if folderId == "__inbox__":
+        query["folderId"] = None
+    elif folderId and folderId != "__all__":
+        query["folderId"] = folderId
+
+    cursor = db.notes.find(query).sort("updatedAt", -1)
+    return [serialize(n) async for n in cursor]
 
 @app.post("/api/notes")
-async def create_note(body: NoteBody, user=Depends(get_current_user)):
-    uid = str(user["_id"])
+async def create_note(body: NoteCreate, user=Depends(get_current_user)):
     now = datetime.utcnow()
+    folder_id = body.folderId if body.folderId not in ("__inbox__", "") else None
     doc = {
-        "userId": uid,
-        "title": body.title or "Sem título",
-        "content": body.content,
-        "priority": body.priority,
-        "dueDate": body.dueDate,
+        "userId":       str(user["_id"]),
+        "title":        body.title or "",
+        "body":         body.body or "",
+        "folderId":     folder_id,
         "linkedItemId": body.linkedItemId,
-        "tags": body.tags,
-        "folderName": body.folderName,
-        "isCompleted": body.isCompleted,
-        "createdAt": now,
-        "updatedAt": now,
-        "deletedAt": None,
+        "priority":     body.priority,
+        "dueDate":      body.dueDate,
+        "tags":         body.tags,
+        "isCompleted":  body.isCompleted,
+        "deletedAt":    None,
+        "createdAt":    now,
+        "updatedAt":    now,
     }
     result = await db.notes.insert_one(doc)
-    return {"noteId": str(result.inserted_id)}
+    doc["_id"] = result.inserted_id
+    return serialize(doc)
 
 @app.patch("/api/notes/{note_id}")
-async def update_note(note_id: str, body: dict, user=Depends(get_current_user)):
-    uid = str(user["_id"])
-    body["updatedAt"] = datetime.utcnow()
-    body.pop("_id", None); body.pop("id", None)
-    await db.notes.update_one(
-        {"_id": ObjectId(note_id), "userId": uid},
-        {"$set": body}
+async def update_note(note_id: str, body: NoteUpdate, user=Depends(get_current_user)):
+    updates = {k: v for k, v in body.dict().items() if v is not None}
+    if not updates:
+        raise HTTPException(status_code=400, detail="Nada para atualizar")
+    # Normaliza inbox sentinel
+    if updates.get("folderId") in ("__inbox__", ""):
+        updates["folderId"] = None
+    updates["updatedAt"] = datetime.utcnow()
+    result = await db.notes.find_one_and_update(
+        {"_id": ObjectId(note_id), "userId": str(user["_id"])},
+        {"$set": updates},
+        return_document=True
     )
-    return {"ok": True}
+    if not result:
+        raise HTTPException(status_code=404, detail="Nota não encontrada")
+    return serialize(result)
 
 @app.delete("/api/notes/{note_id}")
 async def delete_note(note_id: str, user=Depends(get_current_user)):
-    uid = str(user["_id"])
-    await db.notes.update_one(
-        {"_id": ObjectId(note_id), "userId": uid},
-        {"$set": {"deletedAt": datetime.utcnow()}}
+    """Soft delete — move para lixeira (deletedAt = agora). Permanente após 30 dias."""
+    result = await db.notes.find_one_and_update(
+        {"_id": ObjectId(note_id), "userId": str(user["_id"])},
+        {"$set": {"deletedAt": datetime.utcnow()}},
+        return_document=True
     )
+    if not result:
+        raise HTTPException(status_code=404, detail="Nota não encontrada")
     return {"ok": True}
 
+@app.post("/api/notes/{note_id}/restore")
+async def restore_note(note_id: str, user=Depends(get_current_user)):
+    result = await db.notes.find_one_and_update(
+        {"_id": ObjectId(note_id), "userId": str(user["_id"])},
+        {"$set": {"deletedAt": None, "updatedAt": datetime.utcnow()}},
+        return_document=True
+    )
+    if not result:
+        raise HTTPException(status_code=404, detail="Nota não encontrada")
+    return serialize(result)
+
+@app.delete("/api/notes/{note_id}/permanent")
+async def delete_note_permanent(note_id: str, user=Depends(get_current_user)):
+    """Apaga permanentemente da lixeira."""
+    r = await db.notes.delete_one({"_id": ObjectId(note_id), "userId": str(user["_id"])})
+    if r.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Nota não encontrada")
+    return {"ok": True}
+
+@app.post("/api/notes/empty-trash")
+async def empty_trash(user=Depends(get_current_user)):
+    """Esvazia toda a lixeira de notas."""
+    r = await db.notes.delete_many({
+        "userId": str(user["_id"]),
+        "deletedAt": {"$ne": None}
+    })
+    return {"ok": True, "deleted": r.deleted_count}
+
+# ─── METADATA FETCH ──────────────────────────────────────────────────────────
 @app.post("/api/fetch-metadata")
 async def fetch_metadata(body: dict):
     """Fetch title + thumbnail for any URL (bypasses CORS for frontend)."""
@@ -578,99 +710,6 @@ async def migration_status(user=Depends(get_current_user)):
         )
     }
 
-# ─── NOTES ─────────────────────────────────────────────────────────────────────
-
-class NoteCreate(BaseModel):
-    title: str
-    content: str = ""
-    folder_id: Optional[str] = None
-    linked_item_id: Optional[str] = None
-    priority: int = 4
-    tags: List[str] = []
-    due_date: Optional[str] = None
-
-class NoteUpdate(BaseModel):
-    title: Optional[str] = None
-    content: Optional[str] = None
-    folder_id: Optional[str] = None
-    linked_item_id: Optional[str] = None
-    priority: Optional[int] = None
-    tags: Optional[List[str]] = None
-    due_date: Optional[str] = None
-    is_archived: Optional[bool] = None
-
-class NoteFolderCreate(BaseModel):
-    name: str
-    parent_id: Optional[str] = None
-
-@app.get("/api/notes")
-async def get_notes(folder: str = None, user=Depends(get_current_user)):
-    uid = str(user["_id"])
-    query = {"userId": uid, "deleted_at": None}
-    if folder == "inbox":    query["folder_id"] = None
-    elif folder == "today":
-        from datetime import date
-        query["due_date"] = date.today().isoformat()
-    elif folder and folder not in ("all",):
-        query["folder_id"] = folder
-    notes = await db.notes.find(query).sort("updated_at", -1).to_list(None)
-    return [serialize(n) for n in notes]
-
-@app.post("/api/notes")
-async def create_note(body: NoteCreate, user=Depends(get_current_user)):
-    uid = str(user["_id"])
-    doc = {
-        "userId": uid, "title": body.title, "content": body.content,
-        "folder_id": body.folder_id, "linked_item_id": body.linked_item_id,
-        "priority": body.priority, "tags": body.tags, "due_date": body.due_date,
-        "is_archived": False, "deleted_at": None,
-        "created_at": datetime.utcnow(), "updated_at": datetime.utcnow(),
-    }
-    result = await db.notes.insert_one(doc)
-    return {"noteId": str(result.inserted_id)}
-
-@app.patch("/api/notes/{note_id}")
-async def update_note(note_id: str, body: NoteUpdate, user=Depends(get_current_user)):
-    uid = str(user["_id"])
-    upd = {k: v for k, v in body.dict().items() if v is not None}
-    upd["updated_at"] = datetime.utcnow()
-    await db.notes.update_one({"_id": ObjectId(note_id), "userId": uid}, {"$set": upd})
-    return {"ok": True}
-
-@app.delete("/api/notes/{note_id}")
-async def delete_note(note_id: str, user=Depends(get_current_user)):
-    uid = str(user["_id"])
-    await db.notes.update_one(
-        {"_id": ObjectId(note_id), "userId": uid},
-        {"$set": {"deleted_at": datetime.utcnow()}}
-    )
-    return {"ok": True}
-
-@app.get("/api/notes/folders")
-async def get_note_folders(user=Depends(get_current_user)):
-    uid = str(user["_id"])
-    folders = await db.note_folders.find({"userId": uid}).to_list(None)
-    return [serialize(f) for f in folders]
-
-@app.post("/api/notes/folders")
-async def create_note_folder(body: NoteFolderCreate, user=Depends(get_current_user)):
-    uid = str(user["_id"])
-    doc = {"userId": uid, "name": body.name, "parent_id": body.parent_id,
-           "created_at": datetime.utcnow()}
-    result = await db.note_folders.insert_one(doc)
-    return {"folderId": str(result.inserted_id)}
-
-@app.delete("/api/notes/folders/{folder_id}")
-async def delete_note_folder(folder_id: str, user=Depends(get_current_user)):
-    uid = str(user["_id"])
-    await db.notes.update_many(
-        {"userId": uid, "folder_id": folder_id},
-        {"$set": {"folder_id": None}}
-    )
-    await db.note_folders.delete_one({"_id": ObjectId(folder_id), "userId": uid})
-    return {"ok": True}
-
-
 @app.on_event("startup")
 async def startup():
     # Create indexes
@@ -678,7 +717,13 @@ async def startup():
     await db.categories.create_index([("userId", 1), ("order", 1)])
     await db.links.create_index([("userId", 1), ("createdAt", -1)])
     await db.links.create_index([("userId", 1), ("categoryId", 1)])
-    print("✅ WatchList API iniciada — MongoDB conectado")
+    # Notes indexes
+    await db.notes.create_index([("userId", 1), ("updatedAt", -1)])
+    await db.notes.create_index([("userId", 1), ("folderId", 1)])
+    await db.notes.create_index([("userId", 1), ("deletedAt", 1)])
+    await db.notes.create_index([("userId", 1), ("linkedItemId", 1)])
+    await db.note_folders.create_index([("userId", 1), ("order", 1)])
+    print("✅ WatchList API iniciada — MongoDB conectado (com Notes)")
 
 if __name__ == "__main__":
     import uvicorn
