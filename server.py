@@ -146,6 +146,7 @@ class NoteCreate(BaseModel):
     dueDate:      Optional[str] = None     # ISO string
     tags:         List[str] = []
     isCompleted:  bool = False
+    position:     Optional[float] = None   # rank manual; maior = topo da lista
 
 class NoteUpdate(BaseModel):
     title:        Optional[str] = None
@@ -156,6 +157,7 @@ class NoteUpdate(BaseModel):
     dueDate:      Optional[str] = None
     tags:         Optional[List[str]] = None
     isCompleted:  Optional[bool] = None
+    position:     Optional[float] = None
 
 # ─── AUTH ROUTES ──────────────────────────────────────────────────────────────
 @app.get("/api/")
@@ -468,6 +470,8 @@ async def get_notes(
 async def create_note(body: NoteCreate, user=Depends(get_current_user)):
     now = datetime.utcnow()
     folder_id = body.folderId if body.folderId not in ("__inbox__", "") else None
+    # Default position: ms timestamp (newer = higher rank = appears at top)
+    pos = body.position if body.position is not None else now.timestamp() * 1000
     doc = {
         "userId":       str(user["_id"]),
         "title":        body.title or "",
@@ -478,6 +482,7 @@ async def create_note(body: NoteCreate, user=Depends(get_current_user)):
         "dueDate":      body.dueDate,
         "tags":         body.tags,
         "isCompleted":  body.isCompleted,
+        "position":     pos,
         "deletedAt":    None,
         "createdAt":    now,
         "updatedAt":    now,
@@ -718,12 +723,23 @@ async def startup():
     await db.links.create_index([("userId", 1), ("createdAt", -1)])
     await db.links.create_index([("userId", 1), ("categoryId", 1)])
     # Notes indexes
+    await db.notes.create_index([("userId", 1), ("position", -1)])
     await db.notes.create_index([("userId", 1), ("updatedAt", -1)])
     await db.notes.create_index([("userId", 1), ("folderId", 1)])
     await db.notes.create_index([("userId", 1), ("deletedAt", 1)])
     await db.notes.create_index([("userId", 1), ("linkedItemId", 1)])
     await db.note_folders.create_index([("userId", 1), ("order", 1)])
-    print("✅ WatchList API iniciada — MongoDB conectado (com Notes)")
+
+    # Migração: backfill 'position' em notas antigas (a partir do updatedAt em ms)
+    try:
+        await db.notes.update_many(
+            {"position": {"$exists": False}},
+            [{"$set": {"position": {"$toLong": "$updatedAt"}}}]
+        )
+    except Exception as e:
+        print(f"[startup] position backfill skipped: {e}")
+
+    print("✅ WatchList API iniciada — MongoDB conectado (com Notes + reorder)")
 
 if __name__ == "__main__":
     import uvicorn
