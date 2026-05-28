@@ -273,6 +273,58 @@ async def update_category(cat_id: str, body: CategoryUpdate, user=Depends(get_cu
         raise HTTPException(status_code=404, detail="Categoria não encontrada")
     return serialize(result)
 
+@app.delete("/api/categories/by-name/{name}")
+async def delete_category_by_name(name: str, user=Depends(get_current_user)):
+    """
+    Deleta TODAS as categorias do usuário com este nome (case-insensitive).
+    Saída de emergência quando o delete por _id falha (ex: id em formato inválido).
+    Também remove subcategorias (filhas recursivas) e mantém os links como órfãos.
+    """
+    uid = str(user["_id"])
+    # Encontra todas com este nome (case-insensitive)
+    found = await db.categories.find({
+        "userId": uid,
+        "name": {"$regex": f"^{name}$", "$options": "i"}
+    }).to_list(None)
+
+    if not found:
+        return {"ok": True, "deleted": 0, "message": "Nenhuma categoria encontrada"}
+
+    total_deleted = 0
+    deleted_names = []
+
+    async def recurse_delete(cid):
+        nonlocal total_deleted
+        # Apaga filhas primeiro
+        children = await db.categories.find({"userId": uid, "parentId": cid}).to_list(None)
+        for child in children:
+            await recurse_delete(str(child["_id"]))
+        # Apaga a categoria (links viram órfãos)
+        try:
+            r = await db.categories.delete_one({"_id": ObjectId(cid)})
+            total_deleted += r.deleted_count
+        except Exception as e:
+            print(f"[by-name] delete_one falhou para {cid}: {e}")
+
+    for cat in found:
+        cid = str(cat["_id"])
+        deleted_names.append(cat.get("name", "?"))
+        await recurse_delete(cid)
+
+    print(f"[by-name DELETE] user={uid} name='{name}' deleted_count={total_deleted} names={deleted_names}")
+    return {"ok": True, "deleted": total_deleted, "names": deleted_names}
+
+@app.post("/api/categories/nuke-all")
+async def nuke_all_categories(user=Depends(get_current_user)):
+    """
+    🧨 Apaga TODAS as categorias do usuário. Use com cuidado.
+    Os links viram órfãos (aparecem em 'Sem categoria').
+    """
+    uid = str(user["_id"])
+    r = await db.categories.delete_many({"userId": uid})
+    print(f"[NUKE] user={uid} apagou {r.deleted_count} categorias")
+    return {"ok": True, "deleted": r.deleted_count}
+
 @app.delete("/api/categories/{cat_id}")
 async def delete_category(cat_id: str, user=Depends(get_current_user)):
     uid = str(user["_id"])
