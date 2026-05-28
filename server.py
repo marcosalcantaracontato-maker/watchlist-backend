@@ -104,7 +104,7 @@ class LinkCreate(BaseModel):
     rawThumb:   Optional[str] = ""
     platform:   str
     videoId:    Optional[str] = ""
-    categoryId: str
+    categoryId: Optional[str] = None
     watched:    bool = False
     notes:      Optional[str] = ""
     tags:       List[str] = []
