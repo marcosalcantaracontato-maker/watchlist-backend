@@ -5,13 +5,14 @@ FastAPI + MongoDB (Motor) + JWT + Google OAuth
 Deploy: Railway, Render, ou qualquer VPS
 """
 
-from fastapi import FastAPI, HTTPException, Depends, status, Request
+from fastapi import FastAPI, HTTPException, Depends, status, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from typing import Optional
 from motor.motor_asyncio import AsyncIOMotorClient
 from jose import JWTError, jwt
 from pydantic import BaseModel, Field
-from typing import Optional, List, Any
+from typing import List, Any
 from datetime import datetime, timedelta
 from bson import ObjectId
 import os, httpx
@@ -70,11 +71,26 @@ def create_jwt(user_id: str) -> str:
     return jwt.encode({"sub": user_id, "exp": exp}, JWT_SECRET, algorithm=ALGORITHM)
 
 # ─── AUTH MIDDLEWARE ──────────────────────────────────────────────────────────
-security = HTTPBearer()
+# auto_error=False: não lança 403 quando não há Authorization header
+# (permite que o cookie seja usado como fallback)
+security = HTTPBearer(auto_error=False)
 
-async def get_current_user(creds: HTTPAuthorizationCredentials = Depends(security)):
+COOKIE_NAME = "wl_auth"
+
+async def get_current_user(
+    request: Request,
+    creds: Optional[HTTPAuthorizationCredentials] = Depends(security)
+):
+    # Prioridade: 1) Authorization header  2) cookie httpOnly
+    token = None
+    if creds:
+        token = creds.credentials
+    if not token:
+        token = request.cookies.get(COOKIE_NAME)
+    if not token:
+        raise HTTPException(status_code=401, detail="Não autenticado")
     try:
-        payload = jwt.decode(creds.credentials, JWT_SECRET, algorithms=[ALGORITHM])
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[ALGORITHM])
         user_id = payload.get("sub")
         user    = await db.users.find_one({"_id": ObjectId(user_id)})
         if not user:
@@ -165,7 +181,7 @@ async def root():
     return {"status": "ok", "service": "WatchList API v2.0"}
 
 @app.post("/api/auth/google")
-async def login_with_google(body: GoogleLoginRequest):
+async def login_with_google(body: GoogleLoginRequest, response: Response):
     """
     Verifica Google ID token via Google Identity Services (sem Firebase).
     O frontend usa: https://accounts.google.com/gsi/client
@@ -224,9 +240,21 @@ async def login_with_google(body: GoogleLoginRequest):
     
     token = create_jwt(user_id)
     user  = await db.users.find_one({"_id": ObjectId(user_id)})
-    
+
+    # Seta cookie httpOnly — JS não consegue ler, seguro contra XSS
+    # SameSite=none + Secure necessário para cross-origin (Vercel → Railway)
+    response.set_cookie(
+        key=COOKIE_NAME,
+        value=token,
+        httponly=True,
+        secure=True,
+        samesite="none",
+        max_age=TOKEN_EXPIRE_DAYS * 24 * 60 * 60,
+        path="/",
+    )
+
     return {
-        "token":  token,
+        "token":  token,   # mantido para a extensão Chrome
         "user":   serialize(user),
         "is_new": is_new
     }
@@ -236,9 +264,14 @@ async def get_me(user=Depends(get_current_user)):
     return serialize(user)
 
 @app.post("/api/auth/logout")
-async def logout(user=Depends(get_current_user)):
-    # JWT is stateless — client just discards the token
-    # For extra security, you could maintain a token blacklist in Redis
+async def logout(response: Response, user=Depends(get_current_user)):
+    response.delete_cookie(
+        key=COOKIE_NAME,
+        httponly=True,
+        secure=True,
+        samesite="none",
+        path="/",
+    )
     return {"ok": True}
 
 # ─── CATEGORIES ──────────────────────────────────────────────────────────────
