@@ -47,6 +47,21 @@ except ImportError:
 def stripe_ready() -> bool:
     return bool(stripe and STRIPE_SECRET_KEY and STRIPE_PRICE_ID)
 
+# ─── PAGBRASIL (Pix Automático — assinatura recorrente via Pix) ────────────────
+# A PagBrasil exige conta de comerciante + contrato assinado. As credenciais e a
+# URL de produção são fornecidas por eles após a aprovação. Veja PAGBRASIL_SETUP.md.
+PAGBRASIL_SECRET   = os.getenv("PAGBRASIL_SECRET", "")    # "Secret Phrase" do Dashboard
+PAGBRASIL_API_URL  = os.getenv("PAGBRASIL_API_URL", "https://sandbox.pagbrasil.com/api")
+PAGBRASIL_PRICE    = os.getenv("PAGBRASIL_PRICE", "19.00")  # valor mensal em BRL
+# URL pública DESTE backend (para a PagBrasil enviar o webhook)
+BACKEND_PUBLIC_URL = os.getenv("BACKEND_PUBLIC_URL", "https://web-production-99f91.up.railway.app")
+
+def pagbrasil_ready() -> bool:
+    return bool(PAGBRASIL_SECRET)
+
+# Provedor padrão para novas assinaturas: "stripe" (cartão) ou "pagbrasil" (Pix Automático)
+PAYMENT_PROVIDER   = os.getenv("PAYMENT_PROVIDER", "stripe")
+
 # ─── RATE LIMITER ────────────────────────────────────────────────────────────
 limiter = Limiter(key_func=get_remote_address, default_limits=["200/minute"])
 
@@ -356,11 +371,21 @@ async def logout(response: Response, user=Depends(get_current_user)):
     )
     return {"ok": True}
 
-# ─── BILLING / PREMIUM (Stripe) ───────────────────────────────────────────────
+# ─── BILLING / PREMIUM ─────────────────────────────────────────────────────
+# Suporta dois provedores que convivem:
+#   • Stripe     → assinatura mensal por cartão (self-service, funciona já)
+#   • PagBrasil  → Pix Automático recorrente (requer conta/contrato — ver PAGBRASIL_SETUP.md)
 @app.get("/api/billing/config")
 async def billing_config():
-    """Informa ao frontend se o pagamento está habilitado."""
-    return {"enabled": stripe_ready()}
+    """Informa ao frontend quais provedores/métodos de pagamento estão ativos."""
+    methods = []
+    if stripe_ready():    methods.append({"provider": "stripe",    "method": "card",          "label": "Cartão"})
+    if pagbrasil_ready(): methods.append({"provider": "pagbrasil", "method": "pix_automatico", "label": "Pix Automático"})
+    return {
+        "enabled": bool(methods),
+        "default": PAYMENT_PROVIDER,
+        "methods": methods,
+    }
 
 @app.post("/api/billing/checkout")
 @limiter.limit("10/hour")
@@ -472,6 +497,121 @@ async def stripe_webhook(request: Request):
         customer_id = obj.get("customer")
         if customer_id:
             await _set_plan(customer_id, "free", status="past_due")
+
+    return {"received": True}
+
+# ─── PAGBRASIL: Pix Automático (assinatura recorrente via Pix) ─────────────────
+# IMPORTANTE: este adaptador segue a estrutura documentada pela PagBrasil
+# (POST x-www-form-urlencoded para /api/order/add, Secret Phrase, pix_rec_id,
+# webhook com validação de assinatura). Os nomes EXATOS de alguns campos só
+# ficam disponíveis na documentação do dashboard após a aprovação da conta.
+# Trechos marcados com  # CONFIRMAR  devem ser validados contra a doc oficial
+# no onboarding. O adaptador fica inativo até PAGBRASIL_SECRET estar definido.
+
+async def _set_plan_by_field(field: str, value: str, plan: str, status: str = None):
+    """Atualiza o plano localizando o usuário por um campo arbitrário (ex.: pix_rec_id)."""
+    update = {"plan": plan}
+    if status is not None:
+        update["planStatus"] = status
+    r = await db.users.update_one({field: value}, {"$set": update})
+    if r.matched_count == 0:
+        print(f"[pagbrasil] webhook: nenhum usuário com {field}={value}")
+
+@app.post("/api/billing/pagbrasil/checkout")
+@limiter.limit("10/hour")
+async def pagbrasil_checkout(request: Request, user=Depends(get_current_user)):
+    """
+    Inicia uma assinatura via Pix Automático na PagBrasil.
+    Cria o pedido com consentimento de recorrência e devolve o QR Code Pix
+    (imagem + código copia-e-cola) para o usuário autorizar no app do banco.
+    """
+    if not pagbrasil_ready():
+        raise HTTPException(status_code=503, detail="Pix Automático não configurado no servidor.")
+    uid = str(user["_id"])
+
+    # Parâmetros do pedido. # CONFIRMAR os nomes exatos na doc do dashboard PagBrasil.
+    payload = {
+        "secret_token":   PAGBRASIL_SECRET,        # CONFIRMAR (auth via Secret Phrase)
+        "order_id":       f"wl_{uid}_{int(datetime.utcnow().timestamp())}",
+        "amount":         PAGBRASIL_PRICE,
+        "payment_method": "pix_automatic",         # CONFIRMAR (seletor do Pix Automático)
+        "pix_rec":        "1",                      # CONFIRMAR (flag de recorrência/consentimento)
+        "pix_rec_period": "monthly",               # CONFIRMAR (periodicidade)
+        # Dados do cliente
+        "shopper_name":   user.get("name", ""),
+        "shopper_email":  user.get("email", ""),
+        # Retornos
+        "return_url":       f"{APP_PUBLIC_URL}/?checkout=success",
+        "notification_url": f"{BACKEND_PUBLIC_URL}/api/billing/pagbrasil/webhook",  # CONFIRMAR nome do campo
+    }
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.post(
+                f"{PAGBRASIL_API_URL}/order/add",
+                data=payload,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+        r.raise_for_status()
+        data = r.json()
+        # Guarda o id da recorrência para casar com o webhook depois. # CONFIRMAR campo
+        pix_rec_id = data.get("pix_rec_id")
+        if pix_rec_id:
+            await db.users.update_one({"_id": user["_id"]}, {"$set": {"pixRecId": pix_rec_id}})
+        return {
+            "provider":   "pagbrasil",
+            "pixImage":   data.get("pix_image"),     # URL do QR Code
+            "pixCode":    data.get("pix_code"),      # copia-e-cola
+            "expiration": data.get("pix_expiration"),
+            "pixRecId":   pix_rec_id,
+        }
+    except Exception as e:
+        print(f"[pagbrasil] checkout falhou para {uid}: {e}")
+        raise HTTPException(status_code=502, detail="Não foi possível iniciar o Pix Automático.")
+
+def _pagbrasil_signature_ok(payload: bytes, signature: str) -> bool:
+    """Valida a assinatura do webhook PagBrasil.
+    # CONFIRMAR o algoritmo exato (HMAC? campo? header?) na doc do dashboard.
+    Implementação conservadora: HMAC-SHA256 do corpo com a Secret Phrase."""
+    if not signature:
+        return False
+    import hmac, hashlib
+    expected = hmac.new(PAGBRASIL_SECRET.encode(), payload, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, signature)
+
+@app.post("/api/billing/pagbrasil/webhook")
+async def pagbrasil_webhook(request: Request):
+    """
+    Recebe notificações da PagBrasil. Única fonte de verdade do plano Pix.
+    # CONFIRMAR nomes de campos/eventos e o header da assinatura na doc oficial.
+    """
+    if not pagbrasil_ready():
+        raise HTTPException(status_code=503, detail="Pix Automático não configurado.")
+    payload = await request.body()
+    signature = request.headers.get("x-pagbrasil-signature", "")  # CONFIRMAR header
+    if not _pagbrasil_signature_ok(payload, signature):
+        raise HTTPException(status_code=400, detail="Assinatura inválida.")
+
+    try:
+        import json as _json
+        data = _json.loads(payload.decode() or "{}")
+    except Exception:
+        # Pode chegar como form-urlencoded; # CONFIRMAR formato
+        from urllib.parse import parse_qs
+        data = {k: v[0] for k, v in parse_qs(payload.decode()).items()}
+
+    status     = (data.get("status") or "").lower()   # CONFIRMAR valores
+    pix_rec_id = data.get("pix_rec_id")                # CONFIRMAR campo
+
+    if not pix_rec_id:
+        return {"received": True}
+
+    # Mapeia status → plano. # CONFIRMAR os valores exatos de status da PagBrasil.
+    if status in ("authorized", "paid", "approved", "active"):
+        await _set_plan_by_field("pixRecId", pix_rec_id, "premium", status)
+        print(f"[pagbrasil] Premium ativado (pix_rec_id={pix_rec_id})")
+    elif status in ("canceled", "cancelled", "revoked", "rejected", "failed"):
+        await _set_plan_by_field("pixRecId", pix_rec_id, "free", status)
+        print(f"[pagbrasil] Assinatura encerrada (pix_rec_id={pix_rec_id})")
 
     return {"received": True}
 
