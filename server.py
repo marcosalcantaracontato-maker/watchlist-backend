@@ -282,8 +282,24 @@ async def login_with_google(request: Request, body: GoogleLoginRequest, response
     }
 
 @app.get("/api/auth/me")
-async def get_me(user=Depends(get_current_user)):
-    return serialize(user)
+async def get_me(response: Response, user=Depends(get_current_user)):
+    # Devolve um JWT fresco e renova o cookie. Necessário porque o frontend
+    # mantém o JWT apenas em memória — após reload da página ele some, e sem
+    # token as chamadas a /api/links e /api/categories cairiam no cache local
+    # (dando a falsa impressão de que o usuário perdeu todos os dados).
+    token = create_jwt(str(user["_id"]))
+    response.set_cookie(
+        key=COOKIE_NAME,
+        value=token,
+        httponly=True,
+        secure=True,
+        samesite="none",
+        max_age=TOKEN_EXPIRE_DAYS * 24 * 60 * 60,
+        path="/",
+    )
+    data = serialize(user)
+    data["token"] = token
+    return data
 
 @app.post("/api/auth/logout")
 async def logout(response: Response, user=Depends(get_current_user)):
