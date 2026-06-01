@@ -5,7 +5,7 @@ FastAPI + MongoDB (Motor) + JWT + Google OAuth
 Deploy: Railway, Render, ou qualquer VPS
 """
 
-from fastapi import FastAPI, HTTPException, Depends, status, Request, Response
+from fastapi import FastAPI, HTTPException, Depends, status, Request, Response, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from typing import Optional
@@ -91,6 +91,29 @@ def create_jwt(user_id: str) -> str:
     exp = datetime.utcnow() + timedelta(days=TOKEN_EXPIRE_DAYS)
     return jwt.encode({"sub": user_id, "exp": exp}, JWT_SECRET, algorithm=ALGORITHM)
 
+# Campos que serialize() converteu de datetime → ISO string; reconvertidos no restore.
+_DATETIME_FIELDS = {"createdAt", "watchedAt", "updatedAt", "deletedAt", "dueDate", "lastLogin", "migratedAt"}
+
+def deserialize_doc(doc: dict) -> dict:
+    """Inverso de serialize(): prepara um doc do snapshot para reinserção no Mongo.
+    Preserva o _id original (mantém intactas as referências parentId/categoryId/
+    folderId/linkedItemId) e reconverte datas ISO em datetime."""
+    out = dict(doc)
+    raw_id = out.pop("id", None) or out.pop("_id", None)
+    if raw_id:
+        try:
+            out["_id"] = ObjectId(raw_id)
+        except Exception:
+            pass  # id não-ObjectId (ex.: dado legado) — deixa o Mongo gerar um novo
+    for k in _DATETIME_FIELDS:
+        v = out.get(k)
+        if isinstance(v, str) and v:
+            try:
+                out[k] = datetime.fromisoformat(v)
+            except ValueError:
+                pass
+    return out
+
 # ─── AUTH MIDDLEWARE ──────────────────────────────────────────────────────────
 # auto_error=False: não lança 403 quando não há Authorization header
 # (permite que o cookie seja usado como fallback)
@@ -160,6 +183,9 @@ class LinkUpdate(BaseModel):
 class MigrateRequest(BaseModel):
     categories: List[dict]
     links:      List[dict]
+
+class BackupCreate(BaseModel):
+    label: Optional[str] = None   # rótulo opcional para backup manual
 
 # ─── NOTES MODELS ────────────────────────────────────────────────────────────
 class NoteFolderCreate(BaseModel):
@@ -282,11 +308,13 @@ async def login_with_google(request: Request, body: GoogleLoginRequest, response
     }
 
 @app.get("/api/auth/me")
-async def get_me(response: Response, user=Depends(get_current_user)):
+async def get_me(response: Response, background_tasks: BackgroundTasks, user=Depends(get_current_user)):
     # Devolve um JWT fresco e renova o cookie. Necessário porque o frontend
     # mantém o JWT apenas em memória — após reload da página ele some, e sem
     # token as chamadas a /api/links e /api/categories cairiam no cache local
     # (dando a falsa impressão de que o usuário perdeu todos os dados).
+    # Aproveita o load do app para disparar o backup automático diário (background).
+    background_tasks.add_task(maybe_auto_backup, str(user["_id"]))
     token = create_jwt(str(user["_id"]))
     response.set_cookie(
         key=COOKIE_NAME,
@@ -760,6 +788,173 @@ async def fetch_metadata(request: Request, body: dict):
     except Exception as e:
         return {"title": "", "thumbnail": "", "platform": "other", "error": str(e)}
 
+# ─── BACKUP / RESTORE ────────────────────────────────────────────────────────
+AUTO_BACKUP_INTERVAL = timedelta(hours=24)  # 1 snapshot automático por dia
+MAX_AUTO_BACKUPS     = 7                      # retenção de snapshots automáticos
+MAX_MANUAL_BACKUPS   = 10                     # retenção de snapshots manuais
+
+async def _collect_user_data(uid: str) -> dict:
+    """Coleta todos os dados do usuário para um snapshot."""
+    return {
+        "categories":  [serialize(c) async for c in db.categories.find({"userId": uid})],
+        "links":       [serialize(l) async for l in db.links.find({"userId": uid})],
+        "notes":       [serialize(n) async for n in db.notes.find({"userId": uid})],
+        "noteFolders": [serialize(f) async for f in db.note_folders.find({"userId": uid})],
+    }
+
+async def _prune_backups(uid: str, btype: str, keep: int):
+    """Mantém apenas os 'keep' backups mais recentes de um tipo."""
+    old = db.backups.find({"userId": uid, "type": btype}).sort("createdAt", -1).skip(keep)
+    ids = [b["_id"] async for b in old]
+    if ids:
+        await db.backups.delete_many({"_id": {"$in": ids}})
+
+async def _create_backup(uid: str, btype: str = "manual", label: str = None) -> dict:
+    """Cria um snapshot e aplica a política de retenção. Retorna o metadata."""
+    data = await _collect_user_data(uid)
+    counts = {k: len(v) for k, v in data.items()}
+    doc = {
+        "userId":    uid,
+        "type":      btype,
+        "label":     label,
+        "createdAt": datetime.utcnow(),
+        "counts":    counts,
+        "data":      data,
+    }
+    result = await db.backups.insert_one(doc)
+    # Retenção por tipo
+    if btype == "auto":
+        await _prune_backups(uid, "auto", MAX_AUTO_BACKUPS)
+    elif btype == "manual":
+        await _prune_backups(uid, "manual", MAX_MANUAL_BACKUPS)
+    return {
+        "id":        str(result.inserted_id),
+        "type":      btype,
+        "label":     label,
+        "createdAt": doc["createdAt"].isoformat(),
+        "counts":    counts,
+    }
+
+async def maybe_auto_backup(uid: str):
+    """Cria um backup automático se o último tem mais de 24h. Roda em background."""
+    try:
+        last = await db.backups.find_one(
+            {"userId": uid, "type": "auto"}, sort=[("createdAt", -1)]
+        )
+        if last and (datetime.utcnow() - last["createdAt"]) < AUTO_BACKUP_INTERVAL:
+            return
+        # Não cria backup vazio para usuário sem dados ainda
+        has_data = await db.links.count_documents({"userId": uid}) > 0 \
+            or await db.categories.count_documents({"userId": uid}) > 0
+        if not has_data:
+            return
+        await _create_backup(uid, "auto")
+    except Exception as e:
+        print(f"[auto-backup] falhou para {uid}: {e}")
+
+@app.get("/api/backups")
+async def list_backups(user=Depends(get_current_user)):
+    """Lista os backups (apenas metadata — sem o payload pesado)."""
+    uid = str(user["_id"])
+    cursor = db.backups.find(
+        {"userId": uid},
+        {"data": 0},  # exclui o campo data (pesado)
+    ).sort("createdAt", -1)
+    out = []
+    async for b in cursor:
+        out.append({
+            "id":        str(b["_id"]),
+            "type":      b.get("type", "manual"),
+            "label":     b.get("label"),
+            "createdAt": b["createdAt"].isoformat() if isinstance(b["createdAt"], datetime) else b["createdAt"],
+            "counts":    b.get("counts", {}),
+        })
+    return out
+
+@app.post("/api/backups")
+@limiter.limit("10/hour")
+async def create_backup(request: Request, body: BackupCreate, user=Depends(get_current_user)):
+    """Cria um backup manual sob demanda."""
+    uid = str(user["_id"])
+    meta = await _create_backup(uid, "manual", body.label)
+    return {"ok": True, "backup": meta}
+
+@app.get("/api/backups/{backup_id}")
+async def get_backup(backup_id: str, user=Depends(get_current_user)):
+    """Retorna um backup completo (para download/preview)."""
+    uid = str(user["_id"])
+    try:
+        b = await db.backups.find_one({"_id": ObjectId(backup_id), "userId": uid})
+    except Exception:
+        raise HTTPException(status_code=400, detail="ID inválido")
+    if not b:
+        raise HTTPException(status_code=404, detail="Backup não encontrado")
+    return {
+        "id":        str(b["_id"]),
+        "type":      b.get("type", "manual"),
+        "label":     b.get("label"),
+        "createdAt": b["createdAt"].isoformat() if isinstance(b["createdAt"], datetime) else b["createdAt"],
+        "counts":    b.get("counts", {}),
+        "data":      b.get("data", {}),
+    }
+
+@app.delete("/api/backups/{backup_id}")
+async def delete_backup(backup_id: str, user=Depends(get_current_user)):
+    uid = str(user["_id"])
+    try:
+        r = await db.backups.delete_one({"_id": ObjectId(backup_id), "userId": uid})
+    except Exception:
+        raise HTTPException(status_code=400, detail="ID inválido")
+    if r.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Backup não encontrado")
+    return {"ok": True}
+
+@app.post("/api/backups/{backup_id}/restore")
+@limiter.limit("10/hour")
+async def restore_backup(backup_id: str, request: Request, user=Depends(get_current_user)):
+    """
+    Restaura os dados a partir de um backup.
+    SEGURANÇA: antes de sobrescrever, cria um snapshot 'pre-restore' do estado
+    atual — assim a restauração em si também é reversível.
+    Preserva os _id originais para manter todas as referências intactas.
+    """
+    uid = str(user["_id"])
+    try:
+        b = await db.backups.find_one({"_id": ObjectId(backup_id), "userId": uid})
+    except Exception:
+        raise HTTPException(status_code=400, detail="ID inválido")
+    if not b:
+        raise HTTPException(status_code=404, detail="Backup não encontrado")
+
+    # 1) Snapshot de segurança do estado atual (reversível)
+    await _create_backup(uid, "pre-restore", "Antes da restauração")
+    await _prune_backups(uid, "pre-restore", 3)
+
+    data = b.get("data", {})
+    collections = {
+        "categories":  db.categories,
+        "links":       db.links,
+        "notes":       db.notes,
+        "noteFolders": db.note_folders,
+    }
+
+    restored = {}
+    for key, coll in collections.items():
+        docs = data.get(key, [])
+        # 2) Apaga o estado atual desta coleção
+        await coll.delete_many({"userId": uid})
+        # 3) Reinsere do snapshot (preservando _id e datas)
+        if docs:
+            prepared = []
+            for d in docs:
+                doc = deserialize_doc(d)
+                doc["userId"] = uid  # garante posse
+                prepared.append(doc)
+            await coll.insert_many(prepared)
+        restored[key] = len(docs)
+
+    return {"ok": True, "restored": restored}
+
 # ─── EXPORT / IMPORT / MIGRATE ───────────────────────────────────────────────
 @app.get("/api/export")
 async def export_data(user=Depends(get_current_user)):
@@ -890,6 +1085,8 @@ async def startup():
     await db.notes.create_index([("userId", 1), ("deletedAt", 1)])
     await db.notes.create_index([("userId", 1), ("linkedItemId", 1)])
     await db.note_folders.create_index([("userId", 1), ("order", 1)])
+    # Backups
+    await db.backups.create_index([("userId", 1), ("type", 1), ("createdAt", -1)])
 
     # Migração: backfill 'position' em notas antigas (a partir do updatedAt em ms)
     try:
