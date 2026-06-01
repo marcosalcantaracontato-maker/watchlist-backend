@@ -431,13 +431,48 @@ async def batch_update_categories(body: dict, user=Depends(get_current_user)):
     return [serialize(c) async for c in cursor]
 
 # ─── LINKS ────────────────────────────────────────────────────────────────────
+
+@app.get("/api/links/counts")
+async def get_links_counts(user=Depends(get_current_user)):
+    """Contagens leves — usado pela extensão Chrome para evitar carregar todos os links."""
+    uid = str(user["_id"])
+    total = await db.links.count_documents({"userId": uid})
+    pipeline = [
+        {"$match": {"userId": uid}},
+        {"$group": {"_id": "$categoryId", "count": {"$sum": 1}}},
+    ]
+    by_cat = {}
+    async for r in db.links.aggregate(pipeline):
+        by_cat[r["_id"]] = r["count"]
+    return {"total": total, "byCategory": by_cat}
+
 @app.get("/api/links")
-async def get_links(user=Depends(get_current_user), watched: Optional[bool] = None):
+async def get_links(
+    user=Depends(get_current_user),
+    watched: Optional[bool] = None,
+    limit: int = 100,
+    skip: int = 0,
+):
+    """
+    Retorna links paginados.
+    - limit: máx 200 por chamada (default 100)
+    - skip: offset
+    - Resposta: { items, total, skip, limit, hasMore }
+    """
+    limit = min(limit, 200)
     query: dict = {"userId": str(user["_id"])}
     if watched is not None:
         query["watched"] = watched
-    cursor = db.links.find(query).sort("createdAt", -1)
-    return [serialize(l) async for l in cursor]
+    total   = await db.links.count_documents(query)
+    cursor  = db.links.find(query).sort("createdAt", -1).skip(skip).limit(limit)
+    items   = [serialize(l) async for l in cursor]
+    return {
+        "items":   items,
+        "total":   total,
+        "skip":    skip,
+        "limit":   limit,
+        "hasMore": (skip + limit) < total,
+    }
 
 @app.post("/api/links")
 async def create_link(body: LinkCreate, user=Depends(get_current_user)):
