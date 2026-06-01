@@ -17,6 +17,9 @@ from datetime import datetime, timedelta
 from bson import ObjectId
 import os, httpx
 from dotenv import load_dotenv
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 
 load_dotenv()
 
@@ -28,8 +31,13 @@ ALGORITHM              = "HS256"
 TOKEN_EXPIRE_DAYS      = 30
 FRONTEND_URL           = os.getenv("FRONTEND_URL", "*")   # ex: https://watchlist.vercel.app
 
+# ─── RATE LIMITER ────────────────────────────────────────────────────────────
+limiter = Limiter(key_func=get_remote_address, default_limits=["200/minute"])
+
 # ─── APP ─────────────────────────────────────────────────────────────────────
 app = FastAPI(title="WatchList API", version="2.0.0")
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 app.add_middleware(
     CORSMiddleware,
@@ -181,7 +189,8 @@ async def root():
     return {"status": "ok", "service": "WatchList API v2.0"}
 
 @app.post("/api/auth/google")
-async def login_with_google(body: GoogleLoginRequest, response: Response):
+@limiter.limit("5/minute")
+async def login_with_google(request: Request, body: GoogleLoginRequest, response: Response):
     """
     Verifica Google ID token via Google Identity Services (sem Firebase).
     O frontend usa: https://accounts.google.com/gsi/client
@@ -348,7 +357,8 @@ async def delete_category_by_name(name: str, user=Depends(get_current_user)):
     return {"ok": True, "deleted": total_deleted, "names": deleted_names}
 
 @app.post("/api/categories/nuke-all")
-async def nuke_all_categories(user=Depends(get_current_user)):
+@limiter.limit("2/hour")
+async def nuke_all_categories(request: Request, user=Depends(get_current_user)):
     """
     🧨 Apaga TODAS as categorias do usuário. Use com cuidado.
     Os links viram órfãos (aparecem em 'Sem categoria').
@@ -636,7 +646,8 @@ async def empty_trash(user=Depends(get_current_user)):
 
 # ─── METADATA FETCH ──────────────────────────────────────────────────────────
 @app.post("/api/fetch-metadata")
-async def fetch_metadata(body: dict):
+@limiter.limit("20/minute")
+async def fetch_metadata(request: Request, body: dict):
     """Fetch title + thumbnail for any URL (bypasses CORS for frontend)."""
     url = body.get("url", "")
     if not url:
@@ -699,7 +710,8 @@ async def export_data(user=Depends(get_current_user)):
     }
 
 @app.post("/api/migrate")
-async def migrate_data(body: MigrateRequest, user=Depends(get_current_user)):
+@limiter.limit("3/hour")
+async def migrate_data(request: Request, body: MigrateRequest, user=Depends(get_current_user)):
     """
     Migração automática do localStorage para MongoDB no primeiro login.
     Chamado automaticamente pelo frontend quando is_new=True e há dados locais.
