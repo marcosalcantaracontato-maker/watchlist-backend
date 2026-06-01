@@ -10,3 +10,4 @@ python-dotenv==1.0.1
 pydantic==2.7.1
 python-multipart==0.0.9
 slowapi==0.1.9          # rate limiting
+stripe==10.5.0          # assinatura Premium (checkout + webhook)

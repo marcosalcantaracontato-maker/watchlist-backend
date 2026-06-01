@@ -30,6 +30,22 @@ GOOGLE_CLIENT_ID       = os.getenv("GOOGLE_CLIENT_ID", "")
 ALGORITHM              = "HS256"
 TOKEN_EXPIRE_DAYS      = 30
 FRONTEND_URL           = os.getenv("FRONTEND_URL", "")  # ex: https://watchlist.vercel.app
+# URL pública do app para redirecionar após checkout (cai no Vercel se não setada)
+APP_PUBLIC_URL         = FRONTEND_URL or "https://watchlist-frontend-tawny.vercel.app"
+
+# ─── STRIPE (assinatura Premium) ──────────────────────────────────────────────
+STRIPE_SECRET_KEY      = os.getenv("STRIPE_SECRET_KEY", "")
+STRIPE_WEBHOOK_SECRET  = os.getenv("STRIPE_WEBHOOK_SECRET", "")
+STRIPE_PRICE_ID        = os.getenv("STRIPE_PRICE_ID", "")  # price_... da assinatura R$19/mês
+try:
+    import stripe
+    if STRIPE_SECRET_KEY:
+        stripe.api_key = STRIPE_SECRET_KEY
+except ImportError:
+    stripe = None  # biblioteca não instalada — endpoints de billing retornam erro claro
+
+def stripe_ready() -> bool:
+    return bool(stripe and STRIPE_SECRET_KEY and STRIPE_PRICE_ID)
 
 # ─── RATE LIMITER ────────────────────────────────────────────────────────────
 limiter = Limiter(key_func=get_remote_address, default_limits=["200/minute"])
@@ -339,6 +355,125 @@ async def logout(response: Response, user=Depends(get_current_user)):
         path="/",
     )
     return {"ok": True}
+
+# ─── BILLING / PREMIUM (Stripe) ───────────────────────────────────────────────
+@app.get("/api/billing/config")
+async def billing_config():
+    """Informa ao frontend se o pagamento está habilitado."""
+    return {"enabled": stripe_ready()}
+
+@app.post("/api/billing/checkout")
+@limiter.limit("10/hour")
+async def billing_checkout(request: Request, user=Depends(get_current_user)):
+    """Cria uma sessão de checkout do Stripe (assinatura mensal) e devolve a URL."""
+    if not stripe_ready():
+        raise HTTPException(status_code=503, detail="Pagamento não configurado no servidor.")
+    uid = str(user["_id"])
+
+    # Reaproveita o customer do Stripe se já existir (evita duplicar clientes)
+    customer_id = user.get("stripeCustomerId")
+    try:
+        if not customer_id:
+            customer = stripe.Customer.create(
+                email=user.get("email"),
+                name=user.get("name"),
+                metadata={"userId": uid},
+            )
+            customer_id = customer.id
+            await db.users.update_one({"_id": user["_id"]}, {"$set": {"stripeCustomerId": customer_id}})
+
+        session = stripe.checkout.Session.create(
+            mode="subscription",
+            customer=customer_id,
+            client_reference_id=uid,
+            line_items=[{"price": STRIPE_PRICE_ID, "quantity": 1}],
+            allow_promotion_codes=True,
+            success_url=f"{APP_PUBLIC_URL}/?checkout=success",
+            cancel_url=f"{APP_PUBLIC_URL}/?checkout=cancel",
+            metadata={"userId": uid},
+            subscription_data={"metadata": {"userId": uid}},
+        )
+        return {"url": session.url}
+    except Exception as e:
+        print(f"[billing] checkout falhou para {uid}: {e}")
+        raise HTTPException(status_code=502, detail="Não foi possível iniciar o pagamento.")
+
+@app.post("/api/billing/portal")
+@limiter.limit("10/hour")
+async def billing_portal(request: Request, user=Depends(get_current_user)):
+    """Abre o portal do Stripe para o usuário gerenciar/cancelar a assinatura."""
+    if not stripe_ready():
+        raise HTTPException(status_code=503, detail="Pagamento não configurado no servidor.")
+    customer_id = user.get("stripeCustomerId")
+    if not customer_id:
+        raise HTTPException(status_code=400, detail="Nenhuma assinatura encontrada.")
+    try:
+        session = stripe.billing_portal.Session.create(
+            customer=customer_id,
+            return_url=f"{APP_PUBLIC_URL}/",
+        )
+        return {"url": session.url}
+    except Exception as e:
+        print(f"[billing] portal falhou: {e}")
+        raise HTTPException(status_code=502, detail="Não foi possível abrir o portal de assinatura.")
+
+async def _set_plan(customer_id: str, plan: str, sub_id: str = None, status: str = None):
+    """Atualiza o plano do usuário a partir do customer do Stripe."""
+    update = {"plan": plan}
+    if sub_id is not None:    update["stripeSubscriptionId"] = sub_id
+    if status is not None:    update["planStatus"] = status
+    r = await db.users.update_one({"stripeCustomerId": customer_id}, {"$set": update})
+    if r.matched_count == 0:
+        print(f"[billing] webhook: nenhum usuário com customer {customer_id}")
+
+@app.post("/api/billing/webhook")
+async def stripe_webhook(request: Request):
+    """
+    Recebe eventos do Stripe. É a ÚNICA fonte de verdade para conceder/remover
+    Premium — nunca confiar no redirect de sucesso do frontend.
+    Verifica a assinatura do webhook para garantir que veio do Stripe.
+    """
+    if not (stripe and STRIPE_WEBHOOK_SECRET):
+        raise HTTPException(status_code=503, detail="Webhook não configurado.")
+    payload = await request.body()
+    sig = request.headers.get("stripe-signature", "")
+    try:
+        event = stripe.Webhook.construct_event(payload, sig, STRIPE_WEBHOOK_SECRET)
+    except Exception as e:
+        print(f"[billing] webhook inválido: {e}")
+        raise HTTPException(status_code=400, detail="Assinatura do webhook inválida.")
+
+    etype = event["type"]
+    obj   = event["data"]["object"]
+
+    if etype == "checkout.session.completed":
+        customer_id = obj.get("customer")
+        sub_id      = obj.get("subscription")
+        if customer_id:
+            await _set_plan(customer_id, "premium", sub_id, "active")
+            print(f"[billing] Premium ativado para customer {customer_id}")
+
+    elif etype in ("customer.subscription.updated", "customer.subscription.created"):
+        customer_id = obj.get("customer")
+        status      = obj.get("status")  # active, trialing, past_due, canceled, unpaid...
+        sub_id      = obj.get("id")
+        # Premium só enquanto a assinatura estiver ativa/em teste
+        plan = "premium" if status in ("active", "trialing") else "free"
+        if customer_id:
+            await _set_plan(customer_id, plan, sub_id, status)
+
+    elif etype == "customer.subscription.deleted":
+        customer_id = obj.get("customer")
+        if customer_id:
+            await _set_plan(customer_id, "free", None, "canceled")
+            print(f"[billing] Assinatura cancelada para customer {customer_id}")
+
+    elif etype == "invoice.payment_failed":
+        customer_id = obj.get("customer")
+        if customer_id:
+            await _set_plan(customer_id, "free", status="past_due")
+
+    return {"received": True}
 
 # ─── CATEGORIES ──────────────────────────────────────────────────────────────
 @app.get("/api/categories")
