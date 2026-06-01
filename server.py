@@ -29,7 +29,7 @@ JWT_SECRET             = os.getenv("JWT_SECRET", "TROQUE_ISSO_POR_UM_SECRET_FORT
 GOOGLE_CLIENT_ID       = os.getenv("GOOGLE_CLIENT_ID", "")
 ALGORITHM              = "HS256"
 TOKEN_EXPIRE_DAYS      = 30
-FRONTEND_URL           = os.getenv("FRONTEND_URL", "*")   # ex: https://watchlist.vercel.app
+FRONTEND_URL           = os.getenv("FRONTEND_URL", "")  # ex: https://watchlist.vercel.app
 
 # ─── RATE LIMITER ────────────────────────────────────────────────────────────
 limiter = Limiter(key_func=get_remote_address, default_limits=["200/minute"])
@@ -39,9 +39,22 @@ app = FastAPI(title="WatchList API", version="2.0.0")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
+# CORS: allow_credentials=True é incompatível com allow_origins=["*"].
+# O browser bloqueia quando o header retorna "*" + credentials mode "include".
+# Listamos as origens explicitamente e usamos regex para cobrir previews do Vercel.
+_extra = [FRONTEND_URL] if FRONTEND_URL else []
+ALLOWED_ORIGINS = _extra + [
+    "https://watchlist-frontend-tawny.vercel.app",
+    "https://watchlist-frontend-p4uqtoo5g.vercel.app",
+    "https://watchlist-frontend-kupe3dnwt.vercel.app",
+    "http://localhost:3000",
+    "http://localhost:5173",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[FRONTEND_URL, "http://localhost:3000", "http://localhost:5173"],
+    allow_origins=ALLOWED_ORIGINS,
+    allow_origin_regex=r"https://watchlist-frontend.*\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
