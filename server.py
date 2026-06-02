@@ -47,19 +47,27 @@ except ImportError:
 def stripe_ready() -> bool:
     return bool(stripe and STRIPE_SECRET_KEY and STRIPE_PRICE_ID)
 
-# ─── PAGBRASIL (Pix Automático — assinatura recorrente via Pix) ────────────────
-# A PagBrasil exige conta de comerciante + contrato assinado. As credenciais e a
-# URL de produção são fornecidas por eles após a aprovação. Veja PAGBRASIL_SETUP.md.
-PAGBRASIL_SECRET   = os.getenv("PAGBRASIL_SECRET", "")    # "Secret Phrase" do Dashboard
-PAGBRASIL_API_URL  = os.getenv("PAGBRASIL_API_URL", "https://sandbox.pagbrasil.com/api")
-PAGBRASIL_PRICE    = os.getenv("PAGBRASIL_PRICE", "19.00")  # valor mensal em BRL
-# URL pública DESTE backend (para a PagBrasil enviar o webhook)
+# ─── EFÍ / EfiPay (Pix Automático — assinatura recorrente via Pix) ─────────────
+# A API Pix da Efí usa OAuth2 + certificado mTLS (.p12/.pem) OBRIGATÓRIO em toda
+# requisição. Requer conta Efí Empresas (PJ). Veja EFI_SETUP.md.
+EFI_CLIENT_ID      = os.getenv("EFI_CLIENT_ID", "")
+EFI_CLIENT_SECRET  = os.getenv("EFI_CLIENT_SECRET", "")
+EFI_PIX_KEY        = os.getenv("EFI_PIX_KEY", "")        # chave Pix do recebedor (você)
+EFI_PRICE          = os.getenv("EFI_PRICE", "19.00")     # valor mensal em BRL
+EFI_ENV            = os.getenv("EFI_ENV", "sandbox")     # "sandbox" | "production"
+# Certificado mTLS em base64 (PEM). No Railway: cole o conteúdo do .pem em base64.
+EFI_CERT_BASE64    = os.getenv("EFI_CERT_BASE64", "")
+EFI_BASE_URL       = ("https://pix.api.efipay.com.br" if EFI_ENV == "production"
+                      else "https://pix-h.api.efipay.com.br")
+_EFI_CERT_PATH     = None  # preenchido no startup quando o cert é gravado em disco
+
+# URL pública DESTE backend (para os provedores enviarem webhook)
 BACKEND_PUBLIC_URL = os.getenv("BACKEND_PUBLIC_URL", "https://web-production-99f91.up.railway.app")
 
-def pagbrasil_ready() -> bool:
-    return bool(PAGBRASIL_SECRET)
+def efi_ready() -> bool:
+    return bool(EFI_CLIENT_ID and EFI_CLIENT_SECRET and EFI_PIX_KEY and _EFI_CERT_PATH)
 
-# Provedor padrão para novas assinaturas: "stripe" (cartão) ou "pagbrasil" (Pix Automático)
+# Provedor padrão para novas assinaturas: "stripe" (cartão) ou "efi" (Pix Automático)
 PAYMENT_PROVIDER   = os.getenv("PAYMENT_PROVIDER", "stripe")
 
 # ─── RATE LIMITER ────────────────────────────────────────────────────────────
@@ -372,15 +380,15 @@ async def logout(response: Response, user=Depends(get_current_user)):
     return {"ok": True}
 
 # ─── BILLING / PREMIUM ─────────────────────────────────────────────────────
-# Suporta dois provedores que convivem:
-#   • Stripe     → assinatura mensal por cartão (self-service, funciona já)
-#   • PagBrasil  → Pix Automático recorrente (requer conta/contrato — ver PAGBRASIL_SETUP.md)
+# Dois provedores que convivem:
+#   • Stripe → assinatura mensal por cartão (self-service)
+#   • Efí    → Pix Automático recorrente (OAuth2 + mTLS — ver EFI_SETUP.md)
 @app.get("/api/billing/config")
 async def billing_config():
     """Informa ao frontend quais provedores/métodos de pagamento estão ativos."""
     methods = []
-    if stripe_ready():    methods.append({"provider": "stripe",    "method": "card",          "label": "Cartão"})
-    if pagbrasil_ready(): methods.append({"provider": "pagbrasil", "method": "pix_automatico", "label": "Pix Automático"})
+    if stripe_ready(): methods.append({"provider": "stripe", "method": "card",          "label": "Cartão"})
+    if efi_ready():    methods.append({"provider": "efi",    "method": "pix_automatico", "label": "Pix Automático"})
     return {
         "enabled": bool(methods),
         "default": PAYMENT_PROVIDER,
@@ -500,118 +508,134 @@ async def stripe_webhook(request: Request):
 
     return {"received": True}
 
-# ─── PAGBRASIL: Pix Automático (assinatura recorrente via Pix) ─────────────────
-# IMPORTANTE: este adaptador segue a estrutura documentada pela PagBrasil
-# (POST x-www-form-urlencoded para /api/order/add, Secret Phrase, pix_rec_id,
-# webhook com validação de assinatura). Os nomes EXATOS de alguns campos só
-# ficam disponíveis na documentação do dashboard após a aprovação da conta.
-# Trechos marcados com  # CONFIRMAR  devem ser validados contra a doc oficial
-# no onboarding. O adaptador fica inativo até PAGBRASIL_SECRET estar definido.
+# ─── EFÍ: Pix Automático (assinatura recorrente via Pix) ───────────────────────
+# A API Pix da Efí exige OAuth2 + certificado mTLS (.p12/.pem) em TODA requisição.
+# Endpoints (docs públicas dev.efipay.com.br):
+#   POST /oauth/token   → token (Basic base64(client_id:client_secret) + cert)
+#   POST /v2/rec        → cria a recorrência (mandato), devolve idRec
+#   webhook             → confirma autorização/cobrança → define o plano
+# Inativo até EFI_CLIENT_ID/SECRET/PIX_KEY + certificado estarem configurados.
+# Pix Automático requer conta Efí Empresas (PJ). Ver EFI_SETUP.md.
+
+_efi_token_cache = {"token": None, "exp": 0}
+
+async def _efi_token() -> str:
+    """Obtém (e cacheia) o access_token OAuth2 da Efí, usando o certificado mTLS."""
+    import time as _time, base64 as _b64
+    if _efi_token_cache["token"] and _efi_token_cache["exp"] > _time.time() + 30:
+        return _efi_token_cache["token"]
+    auth = _b64.b64encode(f"{EFI_CLIENT_ID}:{EFI_CLIENT_SECRET}".encode()).decode()
+    async with httpx.AsyncClient(cert=_EFI_CERT_PATH, timeout=20) as client:
+        r = await client.post(
+            f"{EFI_BASE_URL}/oauth/token",
+            headers={"Authorization": f"Basic {auth}", "Content-Type": "application/json"},
+            json={"grant_type": "client_credentials"},
+        )
+        r.raise_for_status()
+        d = r.json()
+    _efi_token_cache["token"] = d["access_token"]
+    _efi_token_cache["exp"]   = _time.time() + int(d.get("expires_in", 3600))
+    return _efi_token_cache["token"]
 
 async def _set_plan_by_field(field: str, value: str, plan: str, status: str = None):
-    """Atualiza o plano localizando o usuário por um campo arbitrário (ex.: pix_rec_id)."""
+    """Atualiza o plano localizando o usuário por um campo arbitrário (ex.: efiIdRec)."""
     update = {"plan": plan}
     if status is not None:
         update["planStatus"] = status
     r = await db.users.update_one({field: value}, {"$set": update})
     if r.matched_count == 0:
-        print(f"[pagbrasil] webhook: nenhum usuário com {field}={value}")
+        print(f"[efi] webhook: nenhum usuário com {field}={value}")
 
-@app.post("/api/billing/pagbrasil/checkout")
+class EfiCheckout(BaseModel):
+    cpf: str   # Pix Automático exige o CPF do pagador para o mandato
+
+@app.post("/api/billing/efi/checkout")
 @limiter.limit("10/hour")
-async def pagbrasil_checkout(request: Request, user=Depends(get_current_user)):
+async def efi_checkout(request: Request, body: EfiCheckout, user=Depends(get_current_user)):
     """
-    Inicia uma assinatura via Pix Automático na PagBrasil.
-    Cria o pedido com consentimento de recorrência e devolve o QR Code Pix
-    (imagem + código copia-e-cola) para o usuário autorizar no app do banco.
+    Cria a recorrência (mandato) de Pix Automático na Efí.
+    O usuário autoriza a recorrência no app do banco; o webhook libera o Premium.
     """
-    if not pagbrasil_ready():
+    if not efi_ready():
         raise HTTPException(status_code=503, detail="Pix Automático não configurado no servidor.")
     uid = str(user["_id"])
+    cpf = "".join(filter(str.isdigit, body.cpf or ""))
+    if len(cpf) != 11:
+        raise HTTPException(status_code=400, detail="CPF inválido.")
 
-    # Parâmetros do pedido. # CONFIRMAR os nomes exatos na doc do dashboard PagBrasil.
-    payload = {
-        "secret_token":   PAGBRASIL_SECRET,        # CONFIRMAR (auth via Secret Phrase)
-        "order_id":       f"wl_{uid}_{int(datetime.utcnow().timestamp())}",
-        "amount":         PAGBRASIL_PRICE,
-        "payment_method": "pix_automatic",         # CONFIRMAR (seletor do Pix Automático)
-        "pix_rec":        "1",                      # CONFIRMAR (flag de recorrência/consentimento)
-        "pix_rec_period": "monthly",               # CONFIRMAR (periodicidade)
-        # Dados do cliente
-        "shopper_name":   user.get("name", ""),
-        "shopper_email":  user.get("email", ""),
-        # Retornos
-        "return_url":       f"{APP_PUBLIC_URL}/?checkout=success",
-        "notification_url": f"{BACKEND_PUBLIC_URL}/api/billing/pagbrasil/webhook",  # CONFIRMAR nome do campo
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    # Corpo conforme docs do Pix Automático da Efí (POST /v2/rec).
+    rec_body = {
+        "vinculo": {
+            "contrato": f"wl-{uid}",
+            "devedor":  {"cpf": cpf, "nome": user.get("name", "Cliente")},
+            "objeto":   "WatchList Premium",
+        },
+        "calendario": {"dataInicial": today, "periodicidade": "MENSAL"},
+        "valor":      {"valorRec": str(EFI_PRICE)},
+        "politicaRetentativa": "PERMITE_3R_7D",
+        "recebedor":  {"chave": EFI_PIX_KEY},
     }
     try:
-        async with httpx.AsyncClient(timeout=20) as client:
+        token = await _efi_token()
+        async with httpx.AsyncClient(cert=_EFI_CERT_PATH, timeout=20) as client:
             r = await client.post(
-                f"{PAGBRASIL_API_URL}/order/add",
-                data=payload,
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                f"{EFI_BASE_URL}/v2/rec",
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                json=rec_body,
             )
         r.raise_for_status()
         data = r.json()
-        # Guarda o id da recorrência para casar com o webhook depois. # CONFIRMAR campo
-        pix_rec_id = data.get("pix_rec_id")
-        if pix_rec_id:
-            await db.users.update_one({"_id": user["_id"]}, {"$set": {"pixRecId": pix_rec_id}})
+        id_rec = data.get("idRec")
+        if id_rec:
+            await db.users.update_one({"_id": user["_id"]}, {"$set": {"efiIdRec": id_rec, "efiCpf": cpf}})
+        # A jornada de autorização do mandato é concluída no app do banco do pagador.
+        # Retornamos o idRec e o que a Efí devolver (location/QR quando disponível).
         return {
-            "provider":   "pagbrasil",
-            "pixImage":   data.get("pix_image"),     # URL do QR Code
-            "pixCode":    data.get("pix_code"),      # copia-e-cola
-            "expiration": data.get("pix_expiration"),
-            "pixRecId":   pix_rec_id,
+            "provider": "efi",
+            "idRec":    id_rec,
+            "pixCode":  data.get("pixCopiaECola") or (data.get("loc") or {}).get("pixCopiaECola"),
+            "qrLoc":    (data.get("loc") or {}).get("location"),
+            "raw":      data,
         }
+    except httpx.HTTPStatusError as e:
+        print(f"[efi] checkout HTTP {e.response.status_code}: {e.response.text[:300]}")
+        raise HTTPException(status_code=502, detail="Não foi possível iniciar o Pix Automático.")
     except Exception as e:
-        print(f"[pagbrasil] checkout falhou para {uid}: {e}")
+        print(f"[efi] checkout falhou para {uid}: {e}")
         raise HTTPException(status_code=502, detail="Não foi possível iniciar o Pix Automático.")
 
-def _pagbrasil_signature_ok(payload: bytes, signature: str) -> bool:
-    """Valida a assinatura do webhook PagBrasil.
-    # CONFIRMAR o algoritmo exato (HMAC? campo? header?) na doc do dashboard.
-    Implementação conservadora: HMAC-SHA256 do corpo com a Secret Phrase."""
-    if not signature:
-        return False
-    import hmac, hashlib
-    expected = hmac.new(PAGBRASIL_SECRET.encode(), payload, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(expected, signature)
-
-@app.post("/api/billing/pagbrasil/webhook")
-async def pagbrasil_webhook(request: Request):
+@app.post("/api/billing/efi/webhook")
+async def efi_webhook(request: Request):
     """
-    Recebe notificações da PagBrasil. Única fonte de verdade do plano Pix.
-    # CONFIRMAR nomes de campos/eventos e o header da assinatura na doc oficial.
+    Recebe notificações de recorrência/cobrança da Efí. Fonte de verdade do plano.
+    A Efí valida a origem via mTLS (o webhook é entregue com o certificado dela);
+    casamos o usuário pelo idRec salvo no checkout.
     """
-    if not pagbrasil_ready():
+    if not efi_ready():
         raise HTTPException(status_code=503, detail="Pix Automático não configurado.")
-    payload = await request.body()
-    signature = request.headers.get("x-pagbrasil-signature", "")  # CONFIRMAR header
-    if not _pagbrasil_signature_ok(payload, signature):
-        raise HTTPException(status_code=400, detail="Assinatura inválida.")
-
     try:
-        import json as _json
-        data = _json.loads(payload.decode() or "{}")
+        data = await request.json()
     except Exception:
-        # Pode chegar como form-urlencoded; # CONFIRMAR formato
-        from urllib.parse import parse_qs
-        data = {k: v[0] for k, v in parse_qs(payload.decode()).items()}
+        data = {}
 
-    status     = (data.get("status") or "").lower()   # CONFIRMAR valores
-    pix_rec_id = data.get("pix_rec_id")                # CONFIRMAR campo
+    # A Efí pode enviar lotes de recorrências/cobranças. Normaliza para uma lista.
+    items = data.get("recs") or data.get("rec") or data.get("pix") or [data]
+    if isinstance(items, dict):
+        items = [items]
 
-    if not pix_rec_id:
-        return {"received": True}
-
-    # Mapeia status → plano. # CONFIRMAR os valores exatos de status da PagBrasil.
-    if status in ("authorized", "paid", "approved", "active"):
-        await _set_plan_by_field("pixRecId", pix_rec_id, "premium", status)
-        print(f"[pagbrasil] Premium ativado (pix_rec_id={pix_rec_id})")
-    elif status in ("canceled", "cancelled", "revoked", "rejected", "failed"):
-        await _set_plan_by_field("pixRecId", pix_rec_id, "free", status)
-        print(f"[pagbrasil] Assinatura encerrada (pix_rec_id={pix_rec_id})")
+    for it in items:
+        id_rec = it.get("idRec") or (it.get("vinculo") or {}).get("idRec")
+        status = (it.get("status") or "").upper()
+        if not id_rec:
+            continue
+        # Status de recorrência da Efí: APROVADA/ATIVA liberam; demais encerram.
+        if status in ("APROVADA", "ATIVA", "CONFIRMADA"):
+            await _set_plan_by_field("efiIdRec", id_rec, "premium", status)
+            print(f"[efi] Premium ativado (idRec={id_rec})")
+        elif status in ("CANCELADA", "REJEITADA", "EXPIRADA"):
+            await _set_plan_by_field("efiIdRec", id_rec, "free", status)
+            print(f"[efi] Assinatura encerrada (idRec={id_rec})")
 
     return {"received": True}
 
@@ -1348,6 +1372,20 @@ async def migration_status(user=Depends(get_current_user)):
 
 @app.on_event("startup")
 async def startup():
+    # Grava o certificado mTLS da Efí em disco (a partir do base64 em env var)
+    global _EFI_CERT_PATH
+    if EFI_CERT_BASE64:
+        try:
+            import base64, tempfile, os as _os
+            pem = base64.b64decode(EFI_CERT_BASE64)
+            path = _os.path.join(tempfile.gettempdir(), "efi_cert.pem")
+            with open(path, "wb") as f:
+                f.write(pem)
+            _EFI_CERT_PATH = path
+            print("✅ Certificado Efí carregado")
+        except Exception as e:
+            print(f"[startup] falha ao carregar certificado Efí: {e}")
+
     # Create indexes
     await db.users.create_index("email", unique=True)
     await db.categories.create_index([("userId", 1), ("order", 1)])
