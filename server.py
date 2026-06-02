@@ -29,6 +29,9 @@ JWT_SECRET             = os.getenv("JWT_SECRET", "TROQUE_ISSO_POR_UM_SECRET_FORT
 GOOGLE_CLIENT_ID       = os.getenv("GOOGLE_CLIENT_ID", "")
 ALGORITHM              = "HS256"
 TOKEN_EXPIRE_DAYS      = 30
+# E-mails com acesso ao painel admin (separados por vírgula). Ajuste no Railway.
+ADMIN_EMAILS           = {e.strip().lower() for e in os.getenv(
+    "ADMIN_EMAILS", "marcosalcantara.contato@gmail.com").split(",") if e.strip()}
 FRONTEND_URL           = os.getenv("FRONTEND_URL", "")  # ex: https://watchlist.vercel.app
 # URL pública do app para redirecionar após checkout (cai no Vercel se não setada)
 APP_PUBLIC_URL         = FRONTEND_URL or "https://watchlist-frontend-tawny.vercel.app"
@@ -181,6 +184,15 @@ async def get_current_user(
         return user
     except JWTError:
         raise HTTPException(status_code=401, detail="Token inválido ou expirado")
+
+def is_admin(user) -> bool:
+    return bool(user and (user.get("email") or "").lower() in ADMIN_EMAILS)
+
+async def get_admin_user(user=Depends(get_current_user)):
+    """Garante que o usuário autenticado é admin (e-mail na lista ADMIN_EMAILS)."""
+    if not is_admin(user):
+        raise HTTPException(status_code=403, detail="Acesso restrito ao administrador.")
+    return user
 
 # ─── MODELS ──────────────────────────────────────────────────────────────────
 class GoogleLoginRequest(BaseModel):
@@ -340,9 +352,11 @@ async def login_with_google(request: Request, body: GoogleLoginRequest, response
         path="/",
     )
 
+    user_data = serialize(user)
+    user_data["isAdmin"] = is_admin(user)
     return {
         "token":  token,   # mantido para a extensão Chrome
-        "user":   serialize(user),
+        "user":   user_data,
         "is_new": is_new
     }
 
@@ -366,6 +380,7 @@ async def get_me(response: Response, background_tasks: BackgroundTasks, user=Dep
     )
     data = serialize(user)
     data["token"] = token
+    data["isAdmin"] = is_admin(user)
     return data
 
 @app.post("/api/auth/logout")
@@ -1086,6 +1101,151 @@ async def fetch_metadata(request: Request, body: dict):
             }
     except Exception as e:
         return {"title": "", "thumbnail": "", "platform": "other", "error": str(e)}
+
+# ─── ADMIN ─────────────────────────────────────────────────────────────────
+# Todas as rotas exigem get_admin_user (e-mail em ADMIN_EMAILS).
+
+@app.get("/api/admin/stats")
+async def admin_stats(admin=Depends(get_admin_user)):
+    """Métricas agregadas para o dashboard administrativo."""
+    now   = datetime.utcnow()
+    d1    = now - timedelta(days=1)
+    d7    = now - timedelta(days=7)
+    d30   = now - timedelta(days=30)
+
+    total_users   = await db.users.count_documents({})
+    premium_users = await db.users.count_documents({"plan": "premium"})
+    new_1d        = await db.users.count_documents({"createdAt": {"$gte": d1}})
+    new_7d        = await db.users.count_documents({"createdAt": {"$gte": d7}})
+    new_30d       = await db.users.count_documents({"createdAt": {"$gte": d30}})
+    active_7d     = await db.users.count_documents({"lastLogin": {"$gte": d7}})
+    active_30d    = await db.users.count_documents({"lastLogin": {"$gte": d30}})
+
+    total_links   = await db.links.count_documents({})
+    total_cats    = await db.categories.count_documents({})
+    total_notes   = await db.notes.count_documents({})
+
+    free_users = total_users - premium_users
+    conversion = round((premium_users / total_users) * 100, 1) if total_users else 0.0
+    mrr        = round(premium_users * 19.0, 2)
+
+    # Série de novos usuários por dia (últimos 14 dias)
+    signups = []
+    pipeline = [
+        {"$match": {"createdAt": {"$gte": now - timedelta(days=14)}}},
+        {"$group": {"_id": {"$dateToString": {"format": "%Y-%m-%d", "date": "$createdAt"}}, "count": {"$sum": 1}}},
+        {"$sort": {"_id": 1}},
+    ]
+    async for r in db.users.aggregate(pipeline):
+        signups.append({"date": r["_id"], "count": r["count"]})
+
+    return {
+        "users":   {"total": total_users, "premium": premium_users, "free": free_users,
+                    "new1d": new_1d, "new7d": new_7d, "new30d": new_30d,
+                    "active7d": active_7d, "active30d": active_30d},
+        "content": {"links": total_links, "categories": total_cats, "notes": total_notes},
+        "revenue": {"mrr": mrr, "conversionPct": conversion, "pricePerMonth": 19.0},
+        "signups14d": signups,
+    }
+
+@app.get("/api/admin/users")
+async def admin_list_users(
+    admin=Depends(get_admin_user),
+    search: Optional[str] = None,
+    plan: Optional[str] = None,
+    skip: int = 0,
+    limit: int = 25,
+):
+    """Lista paginada de usuários com busca por nome/e-mail e filtro por plano."""
+    limit = min(limit, 100)
+    query: dict = {}
+    if search:
+        rx = {"$regex": search, "$options": "i"}
+        query["$or"] = [{"name": rx}, {"email": rx}]
+    if plan in ("free", "premium"):
+        query["plan"] = plan
+
+    total  = await db.users.count_documents(query)
+    cursor = db.users.find(query).sort("createdAt", -1).skip(skip).limit(limit)
+    users  = []
+    async for u in cursor:
+        uid = str(u["_id"])
+        users.append({
+            "id":        uid,
+            "name":      u.get("name", ""),
+            "email":     u.get("email", ""),
+            "avatar":    u.get("avatar", ""),
+            "plan":      u.get("plan", "free"),
+            "planStatus": u.get("planStatus"),
+            "createdAt": u["createdAt"].isoformat() if isinstance(u.get("createdAt"), datetime) else u.get("createdAt"),
+            "lastLogin": u["lastLogin"].isoformat() if isinstance(u.get("lastLogin"), datetime) else u.get("lastLogin"),
+            "isAdmin":   is_admin(u),
+        })
+    return {"items": users, "total": total, "skip": skip, "limit": limit, "hasMore": (skip + limit) < total}
+
+@app.get("/api/admin/users/{user_id}")
+async def admin_user_detail(user_id: str, admin=Depends(get_admin_user)):
+    """Detalhe de um usuário, incluindo contagem de conteúdo."""
+    try:
+        u = await db.users.find_one({"_id": ObjectId(user_id)})
+    except Exception:
+        raise HTTPException(status_code=400, detail="ID inválido")
+    if not u:
+        raise HTTPException(status_code=404, detail="Usuário não encontrado")
+    uid = str(u["_id"])
+    data = serialize(dict(u))
+    data["counts"] = {
+        "links":      await db.links.count_documents({"userId": uid}),
+        "categories": await db.categories.count_documents({"userId": uid}),
+        "notes":      await db.notes.count_documents({"userId": uid}),
+        "backups":    await db.backups.count_documents({"userId": uid}),
+    }
+    data["isAdmin"] = is_admin(u)
+    return data
+
+class AdminUserUpdate(BaseModel):
+    plan: Optional[str] = None   # "free" | "premium"
+
+@app.patch("/api/admin/users/{user_id}")
+async def admin_update_user(user_id: str, body: AdminUserUpdate, admin=Depends(get_admin_user)):
+    """Atualiza o plano de um usuário manualmente (cortesia/suporte)."""
+    update = {}
+    if body.plan in ("free", "premium"):
+        update["plan"] = body.plan
+        update["planStatus"] = "admin_grant" if body.plan == "premium" else "admin_revoke"
+    if not update:
+        raise HTTPException(status_code=400, detail="Nada para atualizar.")
+    try:
+        r = await db.users.update_one({"_id": ObjectId(user_id)}, {"$set": update})
+    except Exception:
+        raise HTTPException(status_code=400, detail="ID inválido")
+    if r.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Usuário não encontrado")
+    return {"ok": True, "updated": update}
+
+@app.delete("/api/admin/users/{user_id}")
+async def admin_delete_user(user_id: str, admin=Depends(get_admin_user)):
+    """Exclui um usuário e TODOS os seus dados. Irreversível."""
+    if str(admin["_id"]) == user_id:
+        raise HTTPException(status_code=400, detail="Você não pode excluir a própria conta admin aqui.")
+    try:
+        oid = ObjectId(user_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="ID inválido")
+    u = await db.users.find_one({"_id": oid})
+    if not u:
+        raise HTTPException(status_code=404, detail="Usuário não encontrado")
+    uid = user_id
+    deleted = {
+        "links":       (await db.links.delete_many({"userId": uid})).deleted_count,
+        "categories":  (await db.categories.delete_many({"userId": uid})).deleted_count,
+        "notes":       (await db.notes.delete_many({"userId": uid})).deleted_count,
+        "noteFolders": (await db.note_folders.delete_many({"userId": uid})).deleted_count,
+        "backups":     (await db.backups.delete_many({"userId": uid})).deleted_count,
+    }
+    await db.users.delete_one({"_id": oid})
+    print(f"[admin] {admin.get('email')} excluiu usuário {uid} ({u.get('email')})")
+    return {"ok": True, "deleted": deleted}
 
 # ─── BACKUP / RESTORE ────────────────────────────────────────────────────────
 AUTO_BACKUP_INTERVAL = timedelta(hours=24)  # 1 snapshot automático por dia
