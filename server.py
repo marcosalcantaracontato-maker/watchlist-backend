@@ -278,6 +278,17 @@ class NoteUpdate(BaseModel):
 async def root():
     return {"status": "ok", "service": "WatchList API v2.0"}
 
+@app.get("/api/health")
+async def health():
+    """Health check leve que também faz um ping no Mongo — mantém o cluster
+    (Atlas) e o container (Railway) quentes quando chamado por um cron externo
+    a cada ~5 min, evitando o cold start que faz o 1º login falhar."""
+    try:
+        await db.command("ping")
+        return {"status": "ok", "db": "up"}
+    except Exception as e:
+        return {"status": "degraded", "db": "down", "error": str(e)}
+
 @app.post("/api/auth/google")
 @limiter.limit("5/minute")
 async def login_with_google(request: Request, body: GoogleLoginRequest, response: Response):
