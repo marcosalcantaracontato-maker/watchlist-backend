@@ -41,6 +41,9 @@ STRIPE_SECRET_KEY      = os.getenv("STRIPE_SECRET_KEY", "")
 STRIPE_WEBHOOK_SECRET  = os.getenv("STRIPE_WEBHOOK_SECRET", "")
 STRIPE_PRICE_ID        = os.getenv("STRIPE_PRICE_ID", "")  # price_... da assinatura R$19/mês
 YOUTUBE_API_KEY        = os.getenv("YOUTUBE_API_KEY", "")  # opcional: habilita captura de DURAÇÃO ao salvar
+OPENAI_API_KEY         = os.getenv("OPENAI_API_KEY", "")   # opcional: habilita IA (tags + embeddings)
+OPENAI_CHAT_MODEL      = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")
+OPENAI_EMBED_MODEL     = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small")
 try:
     import stripe
     if STRIPE_SECRET_KEY:
@@ -123,6 +126,7 @@ def serialize(doc) -> dict:
     if doc is None:
         return None
     doc["id"] = str(doc.pop("_id"))
+    doc.pop("topicEmbedding", None)  # vetor grande — fica só no servidor
     for k, v in doc.items():
         if isinstance(v, ObjectId):
             doc[k] = str(v)
@@ -857,7 +861,7 @@ async def get_links(
     }
 
 @app.post("/api/links")
-async def create_link(body: LinkCreate, user=Depends(get_current_user)):
+async def create_link(body: LinkCreate, background: BackgroundTasks, user=Depends(get_current_user)):
     # Free plan limit
     if user.get("plan", "free") == "free":
         count = await db.links.count_documents({"userId": str(user["_id"])})
@@ -893,6 +897,9 @@ async def create_link(body: LinkCreate, user=Depends(get_current_user)):
         "isFavorite":      bool(body.isFavorite),
     }
     result = await db.links.insert_one(doc)
+    # IA: enriquece tags + embedding em background (se houver OPENAI_API_KEY)
+    if OPENAI_API_KEY:
+        background.add_task(_enrich_link, str(result.inserted_id), str(user["_id"]), body.title, body.tags)
     return {"linkId": str(result.inserted_id)}
 
 @app.patch("/api/links/{link_id}")
@@ -1154,8 +1161,100 @@ async def home_layout(user=Depends(get_current_user)):
             })
             order += 1
 
+    # Semântico (Fase 2): "Porque você assistiu X" — similaridade de embedding ao
+    # último vídeo assistido. Manda só os IDs; o front hidrata com dados locais.
+    seeds = [l for l in valid if l.get("topicEmbedding") and (l.get("watched") or _progress_pct(l) >= 50)]
+    if seeds:
+        def _cos(a, b):
+            if not a or not b:
+                return 0.0
+            dot = sum(x * y for x, y in zip(a, b))
+            na = math.sqrt(sum(x * x for x in a)); nb = math.sqrt(sum(y * y for y in b))
+            return dot / (na * nb) if na and nb else 0.0
+        src = max(seeds, key=lambda l: _parse_dt(l.get("lastWatchedAt")) or _parse_dt(l.get("watchedAt")) or datetime.min)
+        sims = []
+        for l in valid:
+            if str(l["_id"]) == str(src["_id"]) or not l.get("topicEmbedding"):
+                continue
+            sims.append((str(l["_id"]), _cos(src["topicEmbedding"], l["topicEmbedding"])))
+        sims.sort(key=lambda x: x[1], reverse=True)
+        top = [lid for lid, sc in sims[:12] if sc > 0.3]
+        if len(top) >= 3:
+            title = (src.get("title") or "")[:40]
+            sections.insert(min(2, len(sections)), {
+                "id": "because", "type": "because_you_watched", "order": 0,
+                "title": f'Porque você assistiu "{title}"',
+                "data_source": {"kind": "ids", "ids": top},
+            })
+
     user_state = "new" if len(links) < 3 else "returning"
     return {"version": 1, "user_state": user_state, "generated_at": datetime.utcnow().isoformat(), "sections": sections}
+
+# ─── IA (Fase 2): auto-tagging por LLM + embeddings (OpenAI) ───────────────────
+import math, json as _json, re as _re
+
+async def _ai_tags(title: str) -> list:
+    if not OPENAI_API_KEY or not title:
+        return []
+    try:
+        async with httpx.AsyncClient(timeout=20) as c:
+            r = await c.post("https://api.openai.com/v1/chat/completions",
+                headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+                json={"model": OPENAI_CHAT_MODEL, "temperature": 0.2, "max_tokens": 60,
+                      "messages": [
+                          {"role": "system", "content": "Você gera TAGS DE TÓPICO para um vídeo. Responda APENAS um array JSON com 2 a 4 tags curtas em português (1-2 palavras, Capitalizadas), sem texto extra. Ex: [\"Marketing\",\"Facebook Ads\"]"},
+                          {"role": "user", "content": f"Título: {title}"},
+                      ]})
+            if r.status_code == 200:
+                txt = r.json()["choices"][0]["message"]["content"]
+                m = _re.search(r"\[.*\]", txt, _re.S)
+                if m:
+                    arr = _json.loads(m.group(0))
+                    return [str(t).strip() for t in arr if str(t).strip()][:4]
+    except Exception:
+        pass
+    return []
+
+async def _ai_embedding(text: str):
+    if not OPENAI_API_KEY or not text:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=20) as c:
+            r = await c.post("https://api.openai.com/v1/embeddings",
+                headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+                json={"model": OPENAI_EMBED_MODEL, "input": text[:2000]})
+            if r.status_code == 200:
+                return r.json()["data"][0]["embedding"]
+    except Exception:
+        pass
+    return None
+
+async def _enrich_link(link_id: str, user_id: str, title: str, existing_tags: list):
+    """Job em background: preenche tags[] (LLM) + topicEmbedding (vetor)."""
+    if not OPENAI_API_KEY:
+        return
+    tags = await _ai_tags(title)
+    emb = await _ai_embedding((title or "") + " " + " ".join(tags))
+    updates = {"aiEnrichedAt": datetime.utcnow()}
+    if tags:
+        updates["tags"] = list(dict.fromkeys([*(existing_tags or []), *tags]))
+    if emb:
+        updates["topicEmbedding"] = emb
+    try:
+        await db.links.update_one({"_id": ObjectId(link_id), "userId": user_id}, {"$set": updates})
+    except Exception:
+        pass
+
+@app.post("/api/ai/backfill")
+async def ai_backfill(background: BackgroundTasks, user=Depends(get_current_user)):
+    """Enriquece (em background) os links ainda sem IA do usuário."""
+    if not OPENAI_API_KEY:
+        return {"ok": False, "reason": "no_key"}
+    uid = str(user["_id"])
+    pending = await db.links.find({"userId": uid, "aiEnrichedAt": {"$exists": False}}).to_list(150)
+    for l in pending:
+        background.add_task(_enrich_link, str(l["_id"]), uid, l.get("title", ""), l.get("tags", []))
+    return {"ok": True, "queued": len(pending)}
 
 # ─── METADATA FETCH ──────────────────────────────────────────────────────────
 def _yt_video_id(url: str) -> str:
