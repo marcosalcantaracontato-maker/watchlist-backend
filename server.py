@@ -1299,12 +1299,24 @@ async def ai_status(request: Request):
             probe = {"http": r.status_code, "body": r.text[:400]}
     except Exception as e:
         probe = {"error": str(e)[:300]}
+    models = []
+    if GEMINI_API_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=20) as c:
+                r = await c.get("https://generativelanguage.googleapis.com/v1beta/models",
+                                params={"key": GEMINI_API_KEY, "pageSize": 100})
+                if r.status_code == 200:
+                    models = [m.get("name", "") for m in r.json().get("models", [])]
+                else:
+                    models = [f"ERR {r.status_code}: {r.text[:200]}"]
+        except Exception as e:
+            models = [f"EXC {str(e)[:150]}"]
     tags = await _ai_tags("Tutorial de Marketing Digital e Facebook Ads para iniciantes")
     return {"provider": prov, "configured": True,
             "key_prefix": (GEMINI_API_KEY[:4] if GEMINI_API_KEY else OPENAI_API_KEY[:4]),
             "chat_model": (GEMINI_CHAT_MODEL if GEMINI_API_KEY else OPENAI_CHAT_MODEL),
             "embed_model": (GEMINI_EMBED_MODEL if GEMINI_API_KEY else OPENAI_EMBED_MODEL),
-            "tags_ok": bool(tags), "tags_sample": tags, "probe": probe}
+            "tags_ok": bool(tags), "tags_sample": tags, "probe": probe, "models": models}
 
 @app.post("/api/ai/backfill")
 async def ai_backfill(background: BackgroundTasks, user=Depends(get_current_user)):
