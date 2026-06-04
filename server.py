@@ -40,6 +40,7 @@ APP_PUBLIC_URL         = FRONTEND_URL or "https://watchlist-frontend-tawny.verce
 STRIPE_SECRET_KEY      = os.getenv("STRIPE_SECRET_KEY", "")
 STRIPE_WEBHOOK_SECRET  = os.getenv("STRIPE_WEBHOOK_SECRET", "")
 STRIPE_PRICE_ID        = os.getenv("STRIPE_PRICE_ID", "")  # price_... da assinatura R$19/mês
+YOUTUBE_API_KEY        = os.getenv("YOUTUBE_API_KEY", "")  # opcional: habilita captura de DURAÇÃO ao salvar
 try:
     import stripe
     if STRIPE_SECRET_KEY:
@@ -220,6 +221,12 @@ class LinkCreate(BaseModel):
     notes:      Optional[str] = ""
     tags:       List[str] = []
     order:      int = 0
+    # Sinais comportamentais (fundação das Coleções Inteligentes)
+    durationSeconds: Optional[int] = None
+    watchedSeconds:  Optional[int] = None
+    lastWatchedAt:   Optional[str] = None
+    watchCount:      Optional[int] = None
+    isFavorite:      Optional[bool] = None
 
 class LinkUpdate(BaseModel):
     title:      Optional[str] = None
@@ -230,6 +237,12 @@ class LinkUpdate(BaseModel):
     notes:      Optional[str] = None
     tags:       Optional[List[str]] = None
     order:      Optional[int] = None
+    # Sinais comportamentais (progresso/duração) — persistem o tracking
+    durationSeconds: Optional[int] = None
+    watchedSeconds:  Optional[int] = None
+    lastWatchedAt:   Optional[str] = None
+    watchCount:      Optional[int] = None
+    isFavorite:      Optional[bool] = None
 
 class MigrateRequest(BaseModel):
     categories: List[dict]
@@ -865,7 +878,12 @@ async def create_link(body: LinkCreate, user=Depends(get_current_user)):
         "tags":       body.tags,
         "order":      body.order,
         "createdAt":  datetime.utcnow(),
-        "watchedAt":  None
+        "watchedAt":  None,
+        "durationSeconds": body.durationSeconds,
+        "watchedSeconds":  body.watchedSeconds or 0,
+        "lastWatchedAt":   body.lastWatchedAt,
+        "watchCount":      body.watchCount or 0,
+        "isFavorite":      bool(body.isFavorite),
     }
     result = await db.links.insert_one(doc)
     return {"linkId": str(result.inserted_id)}
@@ -1062,6 +1080,35 @@ async def empty_trash(user=Depends(get_current_user)):
     return {"ok": True, "deleted": r.deleted_count}
 
 # ─── METADATA FETCH ──────────────────────────────────────────────────────────
+def _yt_video_id(url: str) -> str:
+    import re
+    m = re.search(r"(?:v=|youtu\.be/|/embed/|/shorts/)([A-Za-z0-9_-]{11})", url or "")
+    return m.group(1) if m else ""
+
+def _iso8601_to_seconds(s: str) -> int:
+    import re
+    m = re.match(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?", s or "")
+    if not m:
+        return 0
+    h, mi, se = (int(x) if x else 0 for x in m.groups())
+    return h * 3600 + mi * 60 + se
+
+async def _yt_duration(video_id: str):
+    """Duração (s) via YouTube Data API. Só funciona se YOUTUBE_API_KEY estiver setada."""
+    if not YOUTUBE_API_KEY or not video_id:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=8) as c:
+            r = await c.get("https://www.googleapis.com/youtube/v3/videos",
+                            params={"id": video_id, "part": "contentDetails", "key": YOUTUBE_API_KEY})
+            if r.status_code == 200:
+                items = r.json().get("items", [])
+                if items:
+                    return _iso8601_to_seconds(items[0]["contentDetails"]["duration"])
+    except Exception:
+        pass
+    return None
+
 @app.post("/api/fetch-metadata")
 @limiter.limit("20/minute")
 async def fetch_metadata(request: Request, body: dict):
@@ -1077,11 +1124,13 @@ async def fetch_metadata(request: Request, body: dict):
                 r = await c.get(f"https://www.youtube.com/oembed?url={url}&format=json")
                 if r.status_code == 200:
                     d = r.json()
+                    dur = await _yt_duration(_yt_video_id(url))
                     return {
                         "title":     d.get("title", ""),
                         "thumbnail": d.get("thumbnail_url", ""),
                         "platform":  "youtube",
-                        "author":    d.get("author_name", "")
+                        "author":    d.get("author_name", ""),
+                        "durationSeconds": dur,
                     }
         except:
             pass
