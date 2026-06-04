@@ -863,7 +863,14 @@ async def create_link(body: LinkCreate, user=Depends(get_current_user)):
         count = await db.links.count_documents({"userId": str(user["_id"])})
         if count >= 300:
             raise HTTPException(status_code=403, detail="Limite de 300 links no plano Free atingido")
-    
+
+    # Dedup: já está salvo? (videoId p/ vídeos; url exata p/ o resto) → idempotente
+    dup_q = ({"userId": str(user["_id"]), "videoId": body.videoId}
+             if body.videoId else {"userId": str(user["_id"]), "url": body.url})
+    existing = await db.links.find_one(dup_q)
+    if existing:
+        return {"linkId": str(existing["_id"]), "duplicate": True}
+
     doc = {
         "userId":     str(user["_id"]),
         "url":        body.url,
