@@ -1284,11 +1284,27 @@ async def ai_status(request: Request):
     prov = "gemini" if GEMINI_API_KEY else ("openai" if OPENAI_API_KEY else "none")
     if prov == "none":
         return {"provider": "none", "configured": False}
+    probe = {}
+    try:
+        async with httpx.AsyncClient(timeout=20) as c:
+            if GEMINI_API_KEY:
+                r = await c.post(
+                    f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_EMBED_MODEL}:embedContent",
+                    params={"key": GEMINI_API_KEY},
+                    json={"model": f"models/{GEMINI_EMBED_MODEL}", "content": {"parts": [{"text": "teste"}]}})
+            else:
+                r = await c.post("https://api.openai.com/v1/embeddings",
+                    headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+                    json={"model": OPENAI_EMBED_MODEL, "input": "teste"})
+            probe = {"http": r.status_code, "body": r.text[:400]}
+    except Exception as e:
+        probe = {"error": str(e)[:300]}
     tags = await _ai_tags("Tutorial de Marketing Digital e Facebook Ads para iniciantes")
-    emb = await _ai_embedding("teste de embedding")
     return {"provider": prov, "configured": True,
-            "tags_ok": bool(tags), "tags_sample": tags,
-            "embed_ok": bool(emb), "embed_dims": (len(emb) if emb else 0)}
+            "key_prefix": (GEMINI_API_KEY[:4] if GEMINI_API_KEY else OPENAI_API_KEY[:4]),
+            "chat_model": (GEMINI_CHAT_MODEL if GEMINI_API_KEY else OPENAI_CHAT_MODEL),
+            "embed_model": (GEMINI_EMBED_MODEL if GEMINI_API_KEY else OPENAI_EMBED_MODEL),
+            "tags_ok": bool(tags), "tags_sample": tags, "probe": probe}
 
 @app.post("/api/ai/backfill")
 async def ai_backfill(background: BackgroundTasks, user=Depends(get_current_user)):
