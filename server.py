@@ -1277,6 +1277,19 @@ async def _enrich_link(link_id: str, user_id: str, title: str, existing_tags: li
     except Exception:
         pass
 
+@app.get("/api/ai/status")
+@limiter.limit("10/minute")
+async def ai_status(request: Request):
+    """Diagnóstico: confirma se a IA responde (faz 1 chamada mínima de tags+embedding)."""
+    prov = "gemini" if GEMINI_API_KEY else ("openai" if OPENAI_API_KEY else "none")
+    if prov == "none":
+        return {"provider": "none", "configured": False}
+    tags = await _ai_tags("Tutorial de Marketing Digital e Facebook Ads para iniciantes")
+    emb = await _ai_embedding("teste de embedding")
+    return {"provider": prov, "configured": True,
+            "tags_ok": bool(tags), "tags_sample": tags,
+            "embed_ok": bool(emb), "embed_dims": (len(emb) if emb else 0)}
+
 @app.post("/api/ai/backfill")
 async def ai_backfill(background: BackgroundTasks, user=Depends(get_current_user)):
     """Enriquece (em background) os links ainda sem IA do usuário."""
