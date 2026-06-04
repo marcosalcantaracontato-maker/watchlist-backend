@@ -46,7 +46,7 @@ OPENAI_CHAT_MODEL      = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")
 OPENAI_EMBED_MODEL     = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small")
 # Gemini (Google AI Studio) — preferido se setado; free tier faz tags + embeddings.
 GEMINI_API_KEY         = os.getenv("GEMINI_API_KEY", "")
-GEMINI_CHAT_MODEL      = os.getenv("GEMINI_CHAT_MODEL", "gemini-2.0-flash")
+GEMINI_CHAT_MODEL      = os.getenv("GEMINI_CHAT_MODEL", "gemini-2.5-flash-lite")
 GEMINI_EMBED_MODEL     = os.getenv("GEMINI_EMBED_MODEL", "gemini-embedding-001")
 GEMINI_EMBED_DIMS      = int(os.getenv("GEMINI_EMBED_DIMS", "768"))
 
@@ -1225,7 +1225,7 @@ async def _ai_tags(title: str) -> list:
                     f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_CHAT_MODEL}:generateContent",
                     params={"key": GEMINI_API_KEY},
                     json={"contents": [{"parts": [{"text": f"{_TAG_SYS}\n\nTítulo: {title}"}]}],
-                          "generationConfig": {"temperature": 0.2, "maxOutputTokens": 60}})
+                          "generationConfig": {"temperature": 0.2, "maxOutputTokens": 200}})
                 if r.status_code == 200:
                     return _extract_tags(r.json()["candidates"][0]["content"]["parts"][0]["text"])
             else:
@@ -1286,20 +1286,8 @@ async def ai_status(request: Request):
     prov = "gemini" if GEMINI_API_KEY else ("openai" if OPENAI_API_KEY else "none")
     if prov == "none":
         return {"provider": "none", "configured": False}
-    probe = {}
-    if GEMINI_API_KEY:
-        candidates = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash-lite",
-                      "gemini-flash-lite-latest", "gemini-flash-latest", "gemini-2.0-flash", "gemma-4-31b-it"]
-        async with httpx.AsyncClient(timeout=30) as c:
-            for m in candidates:
-                try:
-                    r = await c.post(f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent",
-                        params={"key": GEMINI_API_KEY},
-                        json={"contents": [{"parts": [{"text": "responda apenas: oi"}]}],
-                              "generationConfig": {"maxOutputTokens": 10}})
-                    probe[m] = r.status_code
-                except Exception as e:
-                    probe[m] = str(e)[:40]
+    emb = await _ai_embedding("teste de embedding")
+    probe = {"embed_ok": bool(emb), "embed_dims": (len(emb) if emb else 0)}
     models = []
     if GEMINI_API_KEY:
         try:
