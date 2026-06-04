@@ -221,6 +221,9 @@ class CategoryUpdate(BaseModel):
     parentId: Optional[str] = None
     order:    Optional[int] = None
 
+class StatePut(BaseModel):
+    value: Any = None
+
 class LinkCreate(BaseModel):
     url:        str
     title:      str
@@ -721,6 +724,21 @@ async def update_category(cat_id: str, body: CategoryUpdate, user=Depends(get_cu
     if not result:
         raise HTTPException(status_code=404, detail="Categoria não encontrada")
     return serialize(result)
+
+@app.get("/api/state/{key}")
+async def get_state(key: str, user=Depends(get_current_user)):
+    """Armazenamento genérico por usuário (sincroniza estado entre dispositivos)."""
+    doc = await db.appstate.find_one({"userId": str(user["_id"]), "key": key})
+    return {"key": key, "value": (doc or {}).get("value"), "updatedAt": (doc or {}).get("updatedAt")}
+
+@app.put("/api/state/{key}")
+async def put_state(key: str, body: StatePut, user=Depends(get_current_user)):
+    await db.appstate.update_one(
+        {"userId": str(user["_id"]), "key": key},
+        {"$set": {"value": body.value, "updatedAt": datetime.utcnow()}},
+        upsert=True,
+    )
+    return {"ok": True}
 
 @app.delete("/api/categories/by-name/{name}")
 async def delete_category_by_name(name: str, user=Depends(get_current_user)):
