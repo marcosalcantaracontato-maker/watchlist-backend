@@ -1263,6 +1263,46 @@ async def _ai_embedding(text: str):
         pass
     return None
 
+async def _ai_text(prompt: str, max_tokens: int = 600) -> str:
+    """Geração de texto livre (resumos) — Gemini ou OpenAI."""
+    if not _ai_enabled():
+        return ""
+    try:
+        async with httpx.AsyncClient(timeout=35) as c:
+            if GEMINI_API_KEY:
+                r = await c.post(
+                    f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_CHAT_MODEL}:generateContent",
+                    params={"key": GEMINI_API_KEY},
+                    json={"contents": [{"parts": [{"text": prompt}]}],
+                          "generationConfig": {"temperature": 0.3, "maxOutputTokens": max_tokens}})
+                if r.status_code == 200:
+                    return r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+            else:
+                r = await c.post("https://api.openai.com/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+                    json={"model": OPENAI_CHAT_MODEL, "max_tokens": max_tokens,
+                          "messages": [{"role": "user", "content": prompt}]})
+                if r.status_code == 200:
+                    return r.json()["choices"][0]["message"]["content"].strip()
+    except Exception:
+        pass
+    return ""
+
+async def _yt_description(video_id: str) -> str:
+    if not YOUTUBE_API_KEY or not video_id:
+        return ""
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.get("https://www.googleapis.com/youtube/v3/videos",
+                            params={"id": video_id, "part": "snippet", "key": YOUTUBE_API_KEY})
+            if r.status_code == 200:
+                items = r.json().get("items", [])
+                if items:
+                    return items[0]["snippet"].get("description", "")
+    except Exception:
+        pass
+    return ""
+
 async def _enrich_link(link_id: str, user_id: str, title: str, existing_tags: list):
     """Job em background: preenche tags[] (LLM) + topicEmbedding (vetor)."""
     if not _ai_enabled():
@@ -1306,6 +1346,29 @@ async def ai_status(request: Request):
             "chat_model": (GEMINI_CHAT_MODEL if GEMINI_API_KEY else OPENAI_CHAT_MODEL),
             "embed_model": (GEMINI_EMBED_MODEL if GEMINI_API_KEY else OPENAI_EMBED_MODEL),
             "tags_ok": bool(tags), "tags_sample": tags, "probe": probe, "models": models}
+
+@app.post("/api/ai/summary/{link_id}")
+async def ai_summary(link_id: str, user=Depends(get_current_user)):
+    """Resumo + pontos-chave do vídeo (a partir de título + descrição). Sob demanda."""
+    if not _ai_enabled():
+        raise HTTPException(status_code=400, detail="IA não configurada")
+    link = await db.links.find_one({"_id": ObjectId(link_id), "userId": str(user["_id"])})
+    if not link:
+        raise HTTPException(status_code=404, detail="Link não encontrado")
+    if link.get("aiSummary"):
+        return {"summary": link["aiSummary"]}
+    desc = await _yt_description(link.get("videoId", ""))
+    prompt = (
+        "Resuma este vídeo em português, de forma útil e objetiva. Formato:\n"
+        "1) Um parágrafo curto explicando do que se trata.\n"
+        "2) 3 a 5 pontos-chave em bullets (cada um começando com \"- \").\n"
+        "Sem saudações, sem enrolação.\n\n"
+        f"TÍTULO: {link.get('title','')}\n\nDESCRIÇÃO:\n{desc[:4000]}"
+    )
+    summary = await _ai_text(prompt, 600)
+    if summary:
+        await db.links.update_one({"_id": link["_id"]}, {"$set": {"aiSummary": summary}})
+    return {"summary": summary}
 
 @app.post("/api/ai/backfill")
 async def ai_backfill(background: BackgroundTasks, user=Depends(get_current_user)):
