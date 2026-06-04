@@ -1322,14 +1322,16 @@ async def _yt_description(video_id: str) -> str:
     return ""
 
 async def _enrich_link(link_id: str, user_id: str, title: str, existing_tags: list):
-    """Job em background: preenche tags[] (LLM) + topicEmbedding (vetor)."""
+    """Job em background: preenche aiTopics[] (TEMAS de conteúdo, gerados por IA —
+    separados das tags do usuário) + topicEmbedding (vetor)."""
     if not _ai_enabled():
         return
-    tags = await _ai_tags(title)
-    emb = await _ai_embedding((title or "") + " " + " ".join(tags))
+    topics = await _ai_tags(title)
+    emb = await _ai_embedding((title or "") + " " + " ".join(topics))
     updates = {"aiEnrichedAt": datetime.utcnow()}
-    if tags:
-        updates["tags"] = list(dict.fromkeys([*(existing_tags or []), *tags]))
+    if topics:
+        # Temas de IA ficam em campo PRÓPRIO — nunca poluem link.tags (curadoria do usuário).
+        updates["aiTopics"] = list(dict.fromkeys(topics))
     if emb:
         updates["topicEmbedding"] = emb
     try:
