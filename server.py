@@ -1079,6 +1079,77 @@ async def empty_trash(user=Depends(get_current_user)):
     })
     return {"ok": True, "deleted": r.deleted_count}
 
+# ─── HOME (Server-Driven UI) ──────────────────────────────────────────────────
+# O backend decide QUAIS coleções e em que ORDEM aparecem (+ user_state). O front
+# hidrata os itens com os dados locais frescos (data_source kind=collection).
+def _parse_dt(v):
+    if not v:
+        return None
+    if isinstance(v, datetime):
+        return v.replace(tzinfo=None)
+    try:
+        return datetime.fromisoformat(str(v).replace("Z", "")).replace(tzinfo=None)
+    except Exception:
+        return None
+
+def _progress_pct(l: dict) -> int:
+    if l.get("watched"):
+        return 100
+    d = l.get("durationSeconds") or 0
+    w = l.get("watchedSeconds") or 0
+    if d > 0:
+        return max(0, min(100, round(w / d * 100)))
+    return 0
+
+def _video_status(l: dict) -> str:
+    p = _progress_pct(l)
+    if l.get("watched") or p >= 90:
+        return "completed"
+    if p < 5:
+        return "not_started"
+    lw = _parse_dt(l.get("lastWatchedAt"))
+    days = (datetime.utcnow() - lw).days if lw else 0
+    if p <= 85 and days > 14:
+        return "abandoned"
+    return "in_progress"
+
+def _days_since(l: dict) -> float:
+    c = _parse_dt(l.get("createdAt"))
+    return (datetime.utcnow() - c).days if c else 9999
+
+# Catálogo do sistema (espelha src/lib/collections.ts). min = min_items_to_show.
+HOME_COLLECTIONS = [
+    {"id": "continue",   "name": "Continue assistindo",     "min": 1, "pred": lambda l: _video_status(l) == "in_progress"},
+    {"id": "almost",     "name": "Quase lá",                "min": 1, "pred": lambda l: 75 <= _progress_pct(l) < 90},
+    {"id": "week",       "name": "Salvos esta semana",      "min": 3, "pred": lambda l: _days_since(l) <= 7},
+    {"id": "abandoned",  "name": "Resgatar — abandonados",  "min": 2, "pred": lambda l: _video_status(l) == "abandoned"},
+    {"id": "short",      "name": "Vídeos curtos",           "min": 3, "pred": lambda l: 0 < (l.get("durationSeconds") or 0) < 600},
+    {"id": "notstarted", "name": "Ainda não assistidos",    "min": 4, "pred": lambda l: _video_status(l) == "not_started"},
+]
+
+@app.get("/api/home")
+async def home_layout(user=Depends(get_current_user)):
+    uid = str(user["_id"])
+    cats = await db.categories.find({"userId": uid}).to_list(2000)
+    cat_ids = {str(c["_id"]) for c in cats}
+    links = await db.links.find({"userId": uid}).to_list(5000)
+    valid = [l for l in links if l.get("categoryId") in cat_ids]
+
+    sections = []
+    order = 1
+    for c in HOME_COLLECTIONS:
+        n = sum(1 for l in valid if c["pred"](l))
+        if n >= c["min"]:
+            sections.append({
+                "id": c["id"], "type": "smart_collection", "order": order,
+                "title": c["name"],
+                "data_source": {"kind": "collection", "collection_id": c["id"]},
+            })
+            order += 1
+
+    user_state = "new" if len(links) < 3 else "returning"
+    return {"version": 1, "user_state": user_state, "generated_at": datetime.utcnow().isoformat(), "sections": sections}
+
 # ─── METADATA FETCH ──────────────────────────────────────────────────────────
 def _yt_video_id(url: str) -> str:
     import re
