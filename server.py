@@ -46,8 +46,9 @@ OPENAI_CHAT_MODEL      = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")
 OPENAI_EMBED_MODEL     = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small")
 # Gemini (Google AI Studio) — preferido se setado; free tier faz tags + embeddings.
 GEMINI_API_KEY         = os.getenv("GEMINI_API_KEY", "")
-GEMINI_CHAT_MODEL      = os.getenv("GEMINI_CHAT_MODEL", "gemini-1.5-flash")
-GEMINI_EMBED_MODEL     = os.getenv("GEMINI_EMBED_MODEL", "text-embedding-004")
+GEMINI_CHAT_MODEL      = os.getenv("GEMINI_CHAT_MODEL", "gemini-2.0-flash")
+GEMINI_EMBED_MODEL     = os.getenv("GEMINI_EMBED_MODEL", "gemini-embedding-001")
+GEMINI_EMBED_DIMS      = int(os.getenv("GEMINI_EMBED_DIMS", "768"))
 
 def _ai_enabled() -> bool:
     return bool(GEMINI_API_KEY or OPENAI_API_KEY)
@@ -1248,7 +1249,8 @@ async def _ai_embedding(text: str):
                 r = await c.post(
                     f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_EMBED_MODEL}:embedContent",
                     params={"key": GEMINI_API_KEY},
-                    json={"model": f"models/{GEMINI_EMBED_MODEL}", "content": {"parts": [{"text": text[:2000]}]}})
+                    json={"model": f"models/{GEMINI_EMBED_MODEL}", "content": {"parts": [{"text": text[:2000]}]},
+                          "outputDimensionality": GEMINI_EMBED_DIMS})
                 if r.status_code == 200:
                     return r.json()["embedding"]["values"]
             else:
