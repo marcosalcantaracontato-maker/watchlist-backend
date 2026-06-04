@@ -1291,14 +1291,15 @@ async def ai_status(request: Request):
         async with httpx.AsyncClient(timeout=20) as c:
             if GEMINI_API_KEY:
                 r = await c.post(
-                    f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_EMBED_MODEL}:embedContent",
+                    f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_CHAT_MODEL}:generateContent",
                     params={"key": GEMINI_API_KEY},
-                    json={"model": f"models/{GEMINI_EMBED_MODEL}", "content": {"parts": [{"text": "teste"}]}})
+                    json={"contents": [{"parts": [{"text": f"{_TAG_SYS}\n\nTítulo: Tutorial de Marketing Digital e Facebook Ads"}]}],
+                          "generationConfig": {"temperature": 0.2, "maxOutputTokens": 80}})
             else:
-                r = await c.post("https://api.openai.com/v1/embeddings",
+                r = await c.post("https://api.openai.com/v1/chat/completions",
                     headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
-                    json={"model": OPENAI_EMBED_MODEL, "input": "teste"})
-            probe = {"http": r.status_code, "body": r.text[:400]}
+                    json={"model": OPENAI_CHAT_MODEL, "max_tokens": 80, "messages": [{"role": "user", "content": "diga oi"}]})
+            probe = {"http": r.status_code, "body": r.text[:700]}
     except Exception as e:
         probe = {"error": str(e)[:300]}
     models = []
