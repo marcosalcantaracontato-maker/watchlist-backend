@@ -1287,21 +1287,19 @@ async def ai_status(request: Request):
     if prov == "none":
         return {"provider": "none", "configured": False}
     probe = {}
-    try:
-        async with httpx.AsyncClient(timeout=20) as c:
-            if GEMINI_API_KEY:
-                r = await c.post(
-                    f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_CHAT_MODEL}:generateContent",
-                    params={"key": GEMINI_API_KEY},
-                    json={"contents": [{"parts": [{"text": f"{_TAG_SYS}\n\nTítulo: Tutorial de Marketing Digital e Facebook Ads"}]}],
-                          "generationConfig": {"temperature": 0.2, "maxOutputTokens": 80}})
-            else:
-                r = await c.post("https://api.openai.com/v1/chat/completions",
-                    headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
-                    json={"model": OPENAI_CHAT_MODEL, "max_tokens": 80, "messages": [{"role": "user", "content": "diga oi"}]})
-            probe = {"http": r.status_code, "body": r.text[:700]}
-    except Exception as e:
-        probe = {"error": str(e)[:300]}
+    if GEMINI_API_KEY:
+        candidates = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash-lite",
+                      "gemini-flash-lite-latest", "gemini-flash-latest", "gemini-2.0-flash", "gemma-4-31b-it"]
+        async with httpx.AsyncClient(timeout=30) as c:
+            for m in candidates:
+                try:
+                    r = await c.post(f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent",
+                        params={"key": GEMINI_API_KEY},
+                        json={"contents": [{"parts": [{"text": "responda apenas: oi"}]}],
+                              "generationConfig": {"maxOutputTokens": 10}})
+                    probe[m] = r.status_code
+                except Exception as e:
+                    probe[m] = str(e)[:40]
     models = []
     if GEMINI_API_KEY:
         try:
