@@ -45,13 +45,45 @@ OPENAI_API_KEY         = os.getenv("OPENAI_API_KEY", "")   # opcional: IA via Op
 OPENAI_CHAT_MODEL      = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")
 OPENAI_EMBED_MODEL     = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small")
 # Gemini (Google AI Studio) — preferido se setado; free tier faz tags + embeddings.
+# Aceita VÁRIAS chaves (cota diária separada por projeto): GEMINI_API_KEYS com
+# chaves separadas por vírgula, OU a antiga GEMINI_API_KEY (uma só).
 GEMINI_API_KEY         = os.getenv("GEMINI_API_KEY", "")
+GEMINI_KEYS            = [k.strip() for k in (os.getenv("GEMINI_API_KEYS", "") or GEMINI_API_KEY).split(",") if k.strip()]
 GEMINI_CHAT_MODEL      = os.getenv("GEMINI_CHAT_MODEL", "gemini-2.5-flash-lite")
 GEMINI_EMBED_MODEL     = os.getenv("GEMINI_EMBED_MODEL", "gemini-embedding-001")
 GEMINI_EMBED_DIMS      = int(os.getenv("GEMINI_EMBED_DIMS", "768"))
 
+# Chaves que esgotaram a cota HOJE (key -> 'YYYY-MM-DD'). Reseta sozinho ao virar o dia.
+_gemini_exhausted: dict = {}
+
 def _ai_enabled() -> bool:
-    return bool(GEMINI_API_KEY or OPENAI_API_KEY)
+    return bool(GEMINI_KEYS or OPENAI_API_KEY)
+
+def _gemini_keys_available() -> list:
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    return [k for k in GEMINI_KEYS if _gemini_exhausted.get(k) != today]
+
+async def _gemini_post(path: str, body: dict, timeout: float = 25):
+    """POST na API do Gemini com ROTAÇÃO de chaves. Em 429 (cota diária esgotada),
+    marca a chave como esgotada hoje e passa para a próxima. Tenta 2x por chave
+    (erros transitórios). Retorna o JSON da 1ª resposta 200, ou None se todas
+    falharem/esgotarem."""
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    url = f"https://generativelanguage.googleapis.com/v1beta/{path}"
+    async with httpx.AsyncClient(timeout=timeout) as c:
+        for key in _gemini_keys_available():
+            for _attempt in range(2):
+                try:
+                    r = await c.post(url, params={"key": key}, json=body)
+                except Exception:
+                    continue
+                if r.status_code == 200:
+                    return r.json()
+                if r.status_code == 429:          # cota do dia desta chave acabou
+                    _gemini_exhausted[key] = today
+                    break                         # → próxima chave
+                # outro erro: tenta a 2ª vez; persistindo, vai p/ a próxima chave
+    return None
 try:
     import stripe
     if STRIPE_SECRET_KEY:
@@ -1241,16 +1273,14 @@ async def _ai_tags(title: str) -> list:
     if not title or not _ai_enabled():
         return []
     try:
-        async with httpx.AsyncClient(timeout=20) as c:
-            if GEMINI_API_KEY:
-                r = await c.post(
-                    f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_CHAT_MODEL}:generateContent",
-                    params={"key": GEMINI_API_KEY},
-                    json={"contents": [{"parts": [{"text": f"{_TAG_SYS}\n\nTítulo: {title}"}]}],
-                          "generationConfig": {"temperature": 0.2, "maxOutputTokens": 200}})
-                if r.status_code == 200:
-                    return _extract_tags(r.json()["candidates"][0]["content"]["parts"][0]["text"])
-            else:
+        if GEMINI_KEYS:
+            j = await _gemini_post(f"models/{GEMINI_CHAT_MODEL}:generateContent",
+                {"contents": [{"parts": [{"text": f"{_TAG_SYS}\n\nTítulo: {title}"}]}],
+                 "generationConfig": {"temperature": 0.2, "maxOutputTokens": 200}})
+            if j:
+                return _extract_tags(j["candidates"][0]["content"]["parts"][0]["text"])
+        else:
+            async with httpx.AsyncClient(timeout=20) as c:
                 r = await c.post("https://api.openai.com/v1/chat/completions",
                     headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
                     json={"model": OPENAI_CHAT_MODEL, "temperature": 0.2, "max_tokens": 60,
@@ -1266,16 +1296,14 @@ async def _ai_embedding(text: str):
     if not text or not _ai_enabled():
         return None
     try:
-        async with httpx.AsyncClient(timeout=20) as c:
-            if GEMINI_API_KEY:
-                r = await c.post(
-                    f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_EMBED_MODEL}:embedContent",
-                    params={"key": GEMINI_API_KEY},
-                    json={"model": f"models/{GEMINI_EMBED_MODEL}", "content": {"parts": [{"text": text[:2000]}]},
-                          "outputDimensionality": GEMINI_EMBED_DIMS})
-                if r.status_code == 200:
-                    return r.json()["embedding"]["values"]
-            else:
+        if GEMINI_KEYS:
+            j = await _gemini_post(f"models/{GEMINI_EMBED_MODEL}:embedContent",
+                {"model": f"models/{GEMINI_EMBED_MODEL}", "content": {"parts": [{"text": text[:2000]}]},
+                 "outputDimensionality": GEMINI_EMBED_DIMS})
+            if j:
+                return j["embedding"]["values"]
+        else:
+            async with httpx.AsyncClient(timeout=20) as c:
                 r = await c.post("https://api.openai.com/v1/embeddings",
                     headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
                     json={"model": OPENAI_EMBED_MODEL, "input": text[:2000]})
@@ -1290,16 +1318,14 @@ async def _ai_text(prompt: str, max_tokens: int = 600) -> str:
     if not _ai_enabled():
         return ""
     try:
-        async with httpx.AsyncClient(timeout=35) as c:
-            if GEMINI_API_KEY:
-                r = await c.post(
-                    f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_CHAT_MODEL}:generateContent",
-                    params={"key": GEMINI_API_KEY},
-                    json={"contents": [{"parts": [{"text": prompt}]}],
-                          "generationConfig": {"temperature": 0.3, "maxOutputTokens": max_tokens}})
-                if r.status_code == 200:
-                    return r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
-            else:
+        if GEMINI_KEYS:
+            j = await _gemini_post(f"models/{GEMINI_CHAT_MODEL}:generateContent",
+                {"contents": [{"parts": [{"text": prompt}]}],
+                 "generationConfig": {"temperature": 0.3, "maxOutputTokens": max_tokens}}, timeout=35)
+            if j:
+                return j["candidates"][0]["content"]["parts"][0]["text"].strip()
+        else:
+            async with httpx.AsyncClient(timeout=35) as c:
                 r = await c.post("https://api.openai.com/v1/chat/completions",
                     headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
                     json={"model": OPENAI_CHAT_MODEL, "max_tokens": max_tokens,
@@ -1347,29 +1373,23 @@ async def _enrich_link(link_id: str, user_id: str, title: str, existing_tags: li
 @limiter.limit("10/minute")
 async def ai_status(request: Request):
     """Diagnóstico: confirma se a IA responde (faz 1 chamada mínima de tags+embedding)."""
-    prov = "gemini" if GEMINI_API_KEY else ("openai" if OPENAI_API_KEY else "none")
+    prov = "gemini" if GEMINI_KEYS else ("openai" if OPENAI_API_KEY else "none")
     if prov == "none":
         return {"provider": "none", "configured": False}
     emb = await _ai_embedding("teste de embedding")
     probe = {"embed_ok": bool(emb), "embed_dims": (len(emb) if emb else 0)}
-    models = []
-    if GEMINI_API_KEY:
-        try:
-            async with httpx.AsyncClient(timeout=20) as c:
-                r = await c.get("https://generativelanguage.googleapis.com/v1beta/models",
-                                params={"key": GEMINI_API_KEY, "pageSize": 100})
-                if r.status_code == 200:
-                    models = [m.get("name", "") for m in r.json().get("models", [])]
-                else:
-                    models = [f"ERR {r.status_code}: {r.text[:200]}"]
-        except Exception as e:
-            models = [f"EXC {str(e)[:150]}"]
     tags = await _ai_tags("Tutorial de Marketing Digital e Facebook Ads para iniciantes")
+    keys_info = {
+        "total": len(GEMINI_KEYS),
+        "available_today": len(_gemini_keys_available()),
+        "exhausted_today": [k[:6] + "…" for k, d in _gemini_exhausted.items()
+                            if d == datetime.utcnow().strftime("%Y-%m-%d")],
+    } if GEMINI_KEYS else None
     return {"provider": prov, "configured": True,
-            "key_prefix": (GEMINI_API_KEY[:4] if GEMINI_API_KEY else OPENAI_API_KEY[:4]),
-            "chat_model": (GEMINI_CHAT_MODEL if GEMINI_API_KEY else OPENAI_CHAT_MODEL),
-            "embed_model": (GEMINI_EMBED_MODEL if GEMINI_API_KEY else OPENAI_EMBED_MODEL),
-            "tags_ok": bool(tags), "tags_sample": tags, "probe": probe, "models": models}
+            "keys": keys_info,
+            "chat_model": (GEMINI_CHAT_MODEL if GEMINI_KEYS else OPENAI_CHAT_MODEL),
+            "embed_model": (GEMINI_EMBED_MODEL if GEMINI_KEYS else OPENAI_EMBED_MODEL),
+            "tags_ok": bool(tags), "tags_sample": tags, "probe": probe}
 
 @app.post("/api/ai/summary/{link_id}")
 async def ai_summary(link_id: str, user=Depends(get_current_user)):
