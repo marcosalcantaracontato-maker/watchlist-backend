@@ -224,6 +224,10 @@ class CategoryUpdate(BaseModel):
 class StatePut(BaseModel):
     value: Any = None
 
+class BridgeReq(BaseModel):
+    a: str
+    b: str
+
 class LinkCreate(BaseModel):
     url:        str
     title:      str
@@ -1389,6 +1393,26 @@ async def ai_summary(link_id: str, user=Depends(get_current_user)):
     if summary:
         await db.links.update_one({"_id": link["_id"]}, {"$set": {"aiSummary": summary}})
     return {"summary": summary}
+
+@app.post("/api/ai/bridge")
+async def ai_bridge(body: BridgeReq, user=Depends(get_current_user)):
+    """Sugere uma PONTE entre dois assuntos pouco conectados na biblioteca."""
+    if not _ai_enabled():
+        raise HTTPException(status_code=400, detail="IA não configurada")
+    a = (body.a or "").strip()[:80]
+    b = (body.b or "").strip()[:80]
+    if not a or not b:
+        raise HTTPException(status_code=400, detail="Temas inválidos")
+    prompt = (
+        f"Um usuário tem muitos conteúdos (vídeos) sobre '{a}' e sobre '{b}', "
+        "mas quase nada que conecte os dois assuntos. Em português, de forma curta e prática:\n"
+        "1) Sugira um TEMA-PONTE que liga os dois (1 linha começando com \"Ponte: \").\n"
+        "2) Sugira 1 ou 2 ideias concretas de conteúdo/vídeo para assistir ou criar que "
+        "preencham essa lacuna (bullets começando com \"- \").\n"
+        "Sem saudações, sem enrolação. Máximo 4 linhas."
+    )
+    text = await _ai_text(prompt, 300)
+    return {"suggestion": text}
 
 @app.post("/api/ai/backfill")
 async def ai_backfill(background: BackgroundTasks, user=Depends(get_current_user)):
