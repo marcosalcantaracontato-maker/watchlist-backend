@@ -260,6 +260,10 @@ class BridgeReq(BaseModel):
     a: str
     b: str
 
+class GeminiReq(BaseModel):
+    model: Optional[str] = None
+    body: dict = {}
+
 class LinkCreate(BaseModel):
     url:        str
     title:      str
@@ -1433,6 +1437,39 @@ async def ai_bridge(body: BridgeReq, user=Depends(get_current_user)):
     )
     text = await _ai_text(prompt, 300)
     return {"suggestion": text}
+
+@app.post("/api/ai/gemini")
+async def ai_gemini_proxy(req: GeminiReq, user=Depends(get_current_user)):
+    """Proxy do Gemini com ROTAÇÃO de chaves — usado pela IA do Financeiro (e
+    qualquer chamada que precise do generateContent cru). Devolve {status, data}
+    espelhando a resposta do Gemini para o front aplicar a lógica dele (fallback
+    de modelo etc.). Em 429 rotaciona as chaves; só devolve 429 quando TODAS
+    esgotaram no dia."""
+    if not GEMINI_KEYS:
+        raise HTTPException(status_code=400, detail="IA não configurada (sem chaves Gemini)")
+    model = (req.model or GEMINI_CHAT_MODEL).strip()
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    last = {"status": 502, "data": {"error": {"message": "sem chaves disponíveis"}}}
+    async with httpx.AsyncClient(timeout=60) as c:
+        for key in _gemini_keys_available():
+            try:
+                r = await c.post(url, params={"key": key}, json=req.body)
+            except Exception as e:
+                last = {"status": 599, "data": {"error": {"message": str(e)[:200]}}}
+                continue
+            if r.status_code == 200:
+                return {"status": 200, "data": r.json()}
+            if r.status_code == 429:
+                _gemini_exhausted[key] = today
+                try: last = {"status": 429, "data": r.json()}
+                except Exception: last = {"status": 429, "data": {}}
+                continue
+            # erro não-cota (sobrecarga 503, 400 etc.) → devolve p/ o front decidir
+            try: data = r.json()
+            except Exception: data = {"error": {"message": r.text[:300]}}
+            return {"status": r.status_code, "data": data}
+    return last
 
 @app.post("/api/ai/backfill")
 async def ai_backfill(background: BackgroundTasks, user=Depends(get_current_user)):
