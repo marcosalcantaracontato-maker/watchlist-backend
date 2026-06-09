@@ -50,10 +50,17 @@ OPENAI_EMBED_MODEL     = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small
 GEMINI_API_KEY         = os.getenv("GEMINI_API_KEY", "")
 GEMINI_KEYS            = [k.strip() for k in (os.getenv("GEMINI_API_KEYS", "") or GEMINI_API_KEY).split(",") if k.strip()]
 GEMINI_CHAT_MODEL      = os.getenv("GEMINI_CHAT_MODEL", "gemini-2.5-flash-lite")
+# Fallback de MODELOS: se o primário esgotar a cota do dia (PerDay), tenta o próximo.
+# A cota grátis costuma ser POR MODELO, então trocar de modelo ainda rende.
+GEMINI_CHAT_FALLBACKS  = os.getenv("GEMINI_CHAT_FALLBACKS", "gemini-2.0-flash,gemini-flash-latest,gemini-1.5-flash")
+GEMINI_CHAT_MODELS     = list(dict.fromkeys(
+    [GEMINI_CHAT_MODEL] + [m.strip() for m in GEMINI_CHAT_FALLBACKS.split(",") if m.strip()]))
 GEMINI_EMBED_MODEL     = os.getenv("GEMINI_EMBED_MODEL", "gemini-embedding-001")
 GEMINI_EMBED_DIMS      = int(os.getenv("GEMINI_EMBED_DIMS", "768"))
 
-# Chaves que esgotaram a cota HOJE (key -> 'YYYY-MM-DD'). Reseta sozinho ao virar o dia.
+# Cota esgotada HOJE rastreada por (chave, modelo) -> 'YYYY-MM-DD'. Como o limite
+# grátis é por MODELO, uma chave esgotada no 2.5-flash-lite ainda serve no 2.0-flash.
+# Reseta sozinho ao virar o dia (UTC).
 _gemini_exhausted: dict = {}
 
 def _is_daily_quota_429(data: dict) -> bool:
@@ -75,19 +82,18 @@ def _is_daily_quota_429(data: dict) -> bool:
 def _ai_enabled() -> bool:
     return bool(GEMINI_KEYS or OPENAI_API_KEY)
 
-def _gemini_keys_available() -> list:
+def _gemini_keys_available(model: str) -> list:
     today = datetime.utcnow().strftime("%Y-%m-%d")
-    return [k for k in GEMINI_KEYS if _gemini_exhausted.get(k) != today]
+    return [k for k in GEMINI_KEYS if _gemini_exhausted.get((k, model)) != today]
 
-async def _gemini_post(path: str, body: dict, timeout: float = 25):
-    """POST na API do Gemini com ROTAÇÃO de chaves. Em 429 (cota diária esgotada),
-    marca a chave como esgotada hoje e passa para a próxima. Tenta 2x por chave
-    (erros transitórios). Retorna o JSON da 1ª resposta 200, ou None se todas
-    falharem/esgotarem."""
+async def _gemini_post(path: str, body: dict, model: str, timeout: float = 25):
+    """POST na API do Gemini com ROTAÇÃO de chaves para um MODELO. Em 429 de cota
+    DIÁRIA marca (chave, modelo) como esgotado hoje e passa à próxima chave. Tenta 2x
+    por chave. Retorna o JSON da 1ª resposta 200, ou None se todas falharem/esgotarem."""
     today = datetime.utcnow().strftime("%Y-%m-%d")
     url = f"https://generativelanguage.googleapis.com/v1beta/{path}"
     async with httpx.AsyncClient(timeout=timeout) as c:
-        for key in _gemini_keys_available():
+        for key in _gemini_keys_available(model):
             for _attempt in range(2):
                 try:
                     r = await c.post(url, params={"key": key}, json=body)
@@ -98,8 +104,8 @@ async def _gemini_post(path: str, body: dict, timeout: float = 25):
                 if r.status_code == 429:
                     try: edata = r.json()
                     except Exception: edata = {}
-                    if _is_daily_quota_429(edata):     # cota DIÁRIA acabou → descansa
-                        _gemini_exhausted[key] = today
+                    if _is_daily_quota_429(edata):     # cota DIÁRIA (deste modelo) acabou
+                        _gemini_exhausted[(key, model)] = today
                     break                              # → próxima chave (não queima em limite/min)
                 # outro erro: tenta a 2ª vez; persistindo, vai p/ a próxima chave
     return None
@@ -118,6 +124,20 @@ def _gemini_text(j: dict) -> str:
 # Desliga o "thinking" dos modelos 2.5 (senão consomem o maxOutputTokens pensando
 # e voltam sem texto). Mesclado no generationConfig das chamadas de texto.
 _GEN_NO_THINK = {"thinkingConfig": {"thinkingBudget": 0}}
+
+async def _gemini_chat(prompt: str, max_tokens: int, temperature: float = 0.3, timeout: float = 35):
+    """Geração de texto com FALLBACK de modelos: tenta cada modelo de GEMINI_CHAT_MODELS
+    (cada um rotacionando as chaves) até obter TEXTO. Robusto a cota diária por modelo.
+    Retorna o texto (str) ou '' se nada funcionar."""
+    body = {"contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"temperature": temperature, "maxOutputTokens": max_tokens, **_GEN_NO_THINK}}
+    for model in GEMINI_CHAT_MODELS:
+        j = await _gemini_post(f"models/{model}:generateContent", body, model, timeout=timeout)
+        if j:
+            txt = _gemini_text(j)
+            if txt:
+                return txt
+    return ""
 try:
     import stripe
     if STRIPE_SECRET_KEY:
@@ -1312,11 +1332,9 @@ async def _ai_tags(title: str) -> list:
         return []
     try:
         if GEMINI_KEYS:
-            j = await _gemini_post(f"models/{GEMINI_CHAT_MODEL}:generateContent",
-                {"contents": [{"parts": [{"text": f"{_TAG_SYS}\n\nTítulo: {title}"}]}],
-                 "generationConfig": {"temperature": 0.2, "maxOutputTokens": 200, **_GEN_NO_THINK}})
-            if j:
-                return _extract_tags(_gemini_text(j))
+            txt = await _gemini_chat(f"{_TAG_SYS}\n\nTítulo: {title}", 200, temperature=0.2, timeout=25)
+            if txt:
+                return _extract_tags(txt)
         else:
             async with httpx.AsyncClient(timeout=20) as c:
                 r = await c.post("https://api.openai.com/v1/chat/completions",
@@ -1337,7 +1355,7 @@ async def _ai_embedding(text: str):
         if GEMINI_KEYS:
             j = await _gemini_post(f"models/{GEMINI_EMBED_MODEL}:embedContent",
                 {"model": f"models/{GEMINI_EMBED_MODEL}", "content": {"parts": [{"text": text[:2000]}]},
-                 "outputDimensionality": GEMINI_EMBED_DIMS})
+                 "outputDimensionality": GEMINI_EMBED_DIMS}, GEMINI_EMBED_MODEL)
             if j:
                 return j["embedding"]["values"]
         else:
@@ -1357,11 +1375,7 @@ async def _ai_text(prompt: str, max_tokens: int = 600) -> str:
         return ""
     try:
         if GEMINI_KEYS:
-            j = await _gemini_post(f"models/{GEMINI_CHAT_MODEL}:generateContent",
-                {"contents": [{"parts": [{"text": prompt}]}],
-                 "generationConfig": {"temperature": 0.3, "maxOutputTokens": max_tokens, **_GEN_NO_THINK}}, timeout=35)
-            if j:
-                return _gemini_text(j)
+            return await _gemini_chat(prompt, max_tokens, temperature=0.3, timeout=35)
         else:
             async with httpx.AsyncClient(timeout=35) as c:
                 r = await c.post("https://api.openai.com/v1/chat/completions",
@@ -1417,15 +1431,21 @@ async def ai_status(request: Request):
     emb = await _ai_embedding("teste de embedding")
     probe = {"embed_ok": bool(emb), "embed_dims": (len(emb) if emb else 0)}
     tags = await _ai_tags("Tutorial de Marketing Digital e Facebook Ads para iniciantes")
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    # Uma chave conta como "disponível" se ainda tem cota em ALGUM modelo de chat hoje.
+    usable = [k for k in GEMINI_KEYS
+              if any(_gemini_exhausted.get((k, m)) != today for m in GEMINI_CHAT_MODELS)]
+    dead = [k for k in GEMINI_KEYS
+            if all(_gemini_exhausted.get((k, m)) == today for m in GEMINI_CHAT_MODELS)]
     keys_info = {
         "total": len(GEMINI_KEYS),
-        "available_today": len(_gemini_keys_available()),
-        "exhausted_today": [k[:6] + "…" for k, d in _gemini_exhausted.items()
-                            if d == datetime.utcnow().strftime("%Y-%m-%d")],
+        "available_today": len(usable),
+        "models": GEMINI_CHAT_MODELS,
+        "exhausted_today": [k[:6] + "…" for k in dead],
     } if GEMINI_KEYS else None
     return {"provider": prov, "configured": True,
             "keys": keys_info,
-            "chat_model": (GEMINI_CHAT_MODEL if GEMINI_KEYS else OPENAI_CHAT_MODEL),
+            "chat_model": (GEMINI_CHAT_MODELS[0] if GEMINI_KEYS else OPENAI_CHAT_MODEL),
             "embed_model": (GEMINI_EMBED_MODEL if GEMINI_KEYS else OPENAI_EMBED_MODEL),
             "tags_ok": bool(tags), "tags_sample": tags, "probe": probe}
 
@@ -1481,12 +1501,12 @@ async def ai_gemini_proxy(req: GeminiReq, user=Depends(get_current_user)):
     esgotaram no dia."""
     if not GEMINI_KEYS:
         raise HTTPException(status_code=400, detail="IA não configurada (sem chaves Gemini)")
-    model = (req.model or GEMINI_CHAT_MODEL).strip()
+    model = (req.model or GEMINI_CHAT_MODELS[0]).strip()
     today = datetime.utcnow().strftime("%Y-%m-%d")
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     last = {"status": 502, "data": {"error": {"message": "sem chaves disponíveis"}}}
     async with httpx.AsyncClient(timeout=60) as c:
-        for key in _gemini_keys_available():
+        for key in _gemini_keys_available(model):
             try:
                 r = await c.post(url, params={"key": key}, json=req.body)
             except Exception as e:
@@ -1498,7 +1518,7 @@ async def ai_gemini_proxy(req: GeminiReq, user=Depends(get_current_user)):
                 try: edata = r.json()
                 except Exception: edata = {}
                 if _is_daily_quota_429(edata):     # só marca esgotada se for cota DIÁRIA
-                    _gemini_exhausted[key] = today
+                    _gemini_exhausted[(key, model)] = today
                 last = {"status": 429, "data": edata}
                 continue
             # erro não-cota (sobrecarga 503, 400 etc.) → devolve p/ o front decidir
