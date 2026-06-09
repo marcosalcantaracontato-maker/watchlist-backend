@@ -103,6 +103,21 @@ async def _gemini_post(path: str, body: dict, timeout: float = 25):
                     break                              # → próxima chave (não queima em limite/min)
                 # outro erro: tenta a 2ª vez; persistindo, vai p/ a próxima chave
     return None
+
+def _gemini_text(j: dict) -> str:
+    """Extrai o texto da resposta do Gemini com segurança. Os modelos 2.5 podem
+    voltar SEM parts (ex.: gastaram o orçamento em 'thinking', finishReason
+    MAX_TOKENS) — nesse caso devolve '' em vez de quebrar com KeyError."""
+    try:
+        cand = (j.get("candidates") or [])[0]
+        parts = ((cand.get("content") or {}).get("parts")) or []
+        return "".join(p.get("text", "") for p in parts).strip()
+    except Exception:
+        return ""
+
+# Desliga o "thinking" dos modelos 2.5 (senão consomem o maxOutputTokens pensando
+# e voltam sem texto). Mesclado no generationConfig das chamadas de texto.
+_GEN_NO_THINK = {"thinkingConfig": {"thinkingBudget": 0}}
 try:
     import stripe
     if STRIPE_SECRET_KEY:
@@ -1299,9 +1314,9 @@ async def _ai_tags(title: str) -> list:
         if GEMINI_KEYS:
             j = await _gemini_post(f"models/{GEMINI_CHAT_MODEL}:generateContent",
                 {"contents": [{"parts": [{"text": f"{_TAG_SYS}\n\nTítulo: {title}"}]}],
-                 "generationConfig": {"temperature": 0.2, "maxOutputTokens": 200}})
+                 "generationConfig": {"temperature": 0.2, "maxOutputTokens": 200, **_GEN_NO_THINK}})
             if j:
-                return _extract_tags(j["candidates"][0]["content"]["parts"][0]["text"])
+                return _extract_tags(_gemini_text(j))
         else:
             async with httpx.AsyncClient(timeout=20) as c:
                 r = await c.post("https://api.openai.com/v1/chat/completions",
@@ -1344,9 +1359,9 @@ async def _ai_text(prompt: str, max_tokens: int = 600) -> str:
         if GEMINI_KEYS:
             j = await _gemini_post(f"models/{GEMINI_CHAT_MODEL}:generateContent",
                 {"contents": [{"parts": [{"text": prompt}]}],
-                 "generationConfig": {"temperature": 0.3, "maxOutputTokens": max_tokens}}, timeout=35)
+                 "generationConfig": {"temperature": 0.3, "maxOutputTokens": max_tokens, **_GEN_NO_THINK}}, timeout=35)
             if j:
-                return j["candidates"][0]["content"]["parts"][0]["text"].strip()
+                return _gemini_text(j)
         else:
             async with httpx.AsyncClient(timeout=35) as c:
                 r = await c.post("https://api.openai.com/v1/chat/completions",
