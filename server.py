@@ -56,6 +56,22 @@ GEMINI_EMBED_DIMS      = int(os.getenv("GEMINI_EMBED_DIMS", "768"))
 # Chaves que esgotaram a cota HOJE (key -> 'YYYY-MM-DD'). Reseta sozinho ao virar o dia.
 _gemini_exhausted: dict = {}
 
+def _is_daily_quota_429(data: dict) -> bool:
+    """Distingue um 429 de cota DIÁRIA (PerDay → chave esgotada o dia todo) de um
+    429 de limite POR MINUTO (PerMinute → só um soluço transitório; NÃO queima a
+    chave). No corpo do erro do Gemini, as violações de cota trazem um quotaId/
+    quotaMetric; só o que contém 'PerDay' significa que o dia acabou de verdade.
+    Na dúvida (sem detalhes), tratamos como transitório p/ não matar a chave à toa."""
+    try:
+        for d in (data.get("error", {}).get("details") or []):
+            for v in (d.get("violations") or []):
+                qid = (v.get("quotaId") or "") + "|" + (v.get("quotaMetric") or "")
+                if "PerDay" in qid:
+                    return True
+    except Exception:
+        pass
+    return False
+
 def _ai_enabled() -> bool:
     return bool(GEMINI_KEYS or OPENAI_API_KEY)
 
@@ -79,9 +95,12 @@ async def _gemini_post(path: str, body: dict, timeout: float = 25):
                     continue
                 if r.status_code == 200:
                     return r.json()
-                if r.status_code == 429:          # cota do dia desta chave acabou
-                    _gemini_exhausted[key] = today
-                    break                         # → próxima chave
+                if r.status_code == 429:
+                    try: edata = r.json()
+                    except Exception: edata = {}
+                    if _is_daily_quota_429(edata):     # cota DIÁRIA acabou → descansa
+                        _gemini_exhausted[key] = today
+                    break                              # → próxima chave (não queima em limite/min)
                 # outro erro: tenta a 2ª vez; persistindo, vai p/ a próxima chave
     return None
 try:
@@ -1461,9 +1480,11 @@ async def ai_gemini_proxy(req: GeminiReq, user=Depends(get_current_user)):
             if r.status_code == 200:
                 return {"status": 200, "data": r.json()}
             if r.status_code == 429:
-                _gemini_exhausted[key] = today
-                try: last = {"status": 429, "data": r.json()}
-                except Exception: last = {"status": 429, "data": {}}
+                try: edata = r.json()
+                except Exception: edata = {}
+                if _is_daily_quota_429(edata):     # só marca esgotada se for cota DIÁRIA
+                    _gemini_exhausted[key] = today
+                last = {"status": 429, "data": edata}
                 continue
             # erro não-cota (sobrecarga 503, 400 etc.) → devolve p/ o front decidir
             try: data = r.json()
