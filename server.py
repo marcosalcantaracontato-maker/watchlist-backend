@@ -1965,6 +1965,126 @@ async def library_map(user=Depends(get_current_user)):
         summary = await _chat(prompt, 240, models=GEMINI_SMART_MODELS)
     return {"total": total, "summary": summary, "strengths": strengths, "gaps": gaps, "topics": topics, "orphan": orphan}
 
+_insights_cache = {}  # uid -> (ts, n_items, result)
+
+@app.get("/api/ai/insights")
+async def ai_insights(user=Depends(get_current_user)):
+    """Fase 3 — 'O que eu percebi sobre você': padrões em linguagem natural a partir
+    do que VOCÊ salvou. Os fatos são calculados de forma determinística (temas, recência,
+    plataforma, profundidade, backlog); a IA só os transforma em frases curtas e pessoais.
+    Cacheado ~10min por usuário (invalida quando o nº de itens muda)."""
+    uid = str(user["_id"])
+    now = datetime.utcnow()
+    links = await db.links.find(
+        {"userId": uid},
+        {"aiTopics": 1, "platform": 1, "url": 1, "contentWords": 1, "watched": 1, "createdAt": 1},
+    ).to_list(8000)
+    total = len(links)
+    if total < 5:
+        return {"insights": [], "total": total, "need": 5}
+
+    cached = _insights_cache.get(uid)
+    if cached and cached[1] == total and (now.timestamp() - cached[0]) < 600:
+        return cached[2]
+
+    d30 = now - timedelta(days=30)
+    d7  = now - timedelta(days=7)
+    def _dt(l):
+        v = l.get("createdAt")
+        return v if isinstance(v, datetime) else None
+    week_count  = sum(1 for l in links if (_dt(l) or now) >= d7)
+    month_count = sum(1 for l in links if (_dt(l) or now) >= d30)
+
+    # Temas: frequência total e recente (últimos 30d) → dominante, contraste e "em alta"
+    topic_freq, topic_recent = {}, {}
+    for l in links:
+        recent = (_dt(l) or datetime(2000, 1, 1)) >= d30
+        for t in (l.get("aiTopics") or []):
+            topic_freq[t] = topic_freq.get(t, 0) + 1
+            if recent:
+                topic_recent[t] = topic_recent.get(t, 0) + 1
+    top_topics = sorted(topic_freq.items(), key=lambda x: -x[1])
+    dominant = top_topics[0] if top_topics else None
+    # contraste: tema relevante porém com pouca presença (o "47 vs 2")
+    small = next(((t, c) for t, c in reversed(top_topics) if 1 <= c <= 2 and total >= 12), None)
+    # em alta: tema cuja maioria das adições é recente (e tem massa mínima)
+    rising = None
+    for t, c in top_topics:
+        r = topic_recent.get(t, 0)
+        if c >= 3 and r >= 2 and r / c >= 0.5:
+            rising = (t, r, c); break
+
+    # Plataforma dominante
+    plat_freq = {}
+    for l in links:
+        p = (l.get("platform") or "").strip()
+        if not p or p == "other":
+            try:
+                p = _re.sub(r"^www\.", "", (l.get("url") or "").split("/")[2]).split(".")[0]
+            except Exception:
+                p = "outros"
+        plat_freq[p] = plat_freq.get(p, 0) + 1
+    top_plat = max(plat_freq.items(), key=lambda x: x[1]) if plat_freq else None
+
+    deep    = sum(1 for l in links if (l.get("contentWords") or 0) > 200)
+    watched = sum(1 for l in links if l.get("watched"))
+    backlog = total - watched
+
+    # Monta os FATOS (números reais) para a IA narrar — nada além disto pode ser dito.
+    facts = [f"Total salvo: {total}.",
+             f"Adicionados nos últimos 30 dias: {month_count}; nesta semana: {week_count}.",
+             f"Já consumidos: {watched}; ainda na fila: {backlog}.",
+             f"Conteúdos com leitura profunda (texto extraído): {deep}."]
+    if dominant:
+        facts.append(f"Tema dominante: '{dominant[0]}' com {dominant[1]} conteúdos.")
+    if small:
+        facts.append(f"Tema com pouca presença: '{small[0]}' com apenas {small[1]}.")
+    if rising:
+        facts.append(f"Tema em alta: '{rising[0]}' — {rising[1]} dos {rising[2]} são recentes (últimos 30 dias).")
+    if top_plat:
+        facts.append(f"Plataforma mais usada: {top_plat[0]} ({top_plat[1]} conteúdos).")
+    other_topics = ", ".join(f"{t} ({c})" for t, c in top_topics[1:8])
+    if other_topics:
+        facts.append(f"Outros temas: {other_topics}.")
+
+    insights = []
+    if _ai_enabled():
+        prompt = (
+            "Você analisa a biblioteca pessoal de conteúdos de alguém e aponta PADRÕES que a "
+            "pessoa talvez não tenha notado — como um amigo observador e inteligente. "
+            "Gere de 3 a 5 percepções CURTAS (1 frase cada), em português, na 2ª pessoa ('você'), "
+            "tom pessoal e direto, SEM jargão técnico. Cada percepção deve usar números REAIS dos "
+            "fatos abaixo e, quando fizer sentido, sugerir sutilmente um próximo passo. "
+            "NÃO invente nada que não esteja nos fatos. Responda APENAS um array JSON: "
+            '[{"icon":"<1 emoji>","text":"<frase>"}].\n\nFATOS:\n' + "\n".join(facts)
+        )
+        txt = await _chat(prompt, 420, temperature=0.4, models=GEMINI_SMART_MODELS)
+        try:
+            m = _re.search(r"\[.*\]", txt, _re.S)
+            if m:
+                for it in _json.loads(m.group(0)):
+                    t = str(it.get("text", "")).strip()
+                    if t:
+                        insights.append({"icon": str(it.get("icon", "✨"))[:4], "text": t[:240]})
+        except Exception:
+            pass
+
+    # Fallback determinístico (IA indisponível ou parse falhou)
+    if not insights:
+        if dominant:
+            insights.append({"icon": "🎯", "text": f"Seu maior foco é '{dominant[0]}': {dominant[1]} conteúdos salvos."})
+        if rising:
+            insights.append({"icon": "📈", "text": f"'{rising[0]}' está em alta — {rising[1]} dos {rising[2]} são das últimas semanas."})
+        if backlog > 0:
+            insights.append({"icon": "📚", "text": f"Você tem {backlog} conteúdos esperando — que tal escolher 1 pra hoje?"})
+        if small and dominant:
+            insights.append({"icon": "🔍", "text": f"Muito '{dominant[0]}', mas só {small[1]} sobre '{small[0]}' — um ponto a explorar."})
+
+    result = {"insights": insights[:5], "total": total,
+              "stats": {"week": week_count, "month": month_count, "watched": watched, "backlog": backlog, "deep": deep}}
+    _insights_cache[uid] = (now.timestamp(), total, result)
+    return result
+
 _topics_cache = {}  # uid -> (ts, n_items, result) — evita reclusterizar/renomear a cada abertura
 
 @app.get("/api/ai/topics")
