@@ -1968,6 +1968,25 @@ async def library_map(user=Depends(get_current_user)):
             topic_freq[t] = topic_freq.get(t, 0) + 1
     top_topics = sorted(topic_freq.items(), key=lambda x: -x[1])[:12]
     topics = [{"name": t, "count": c} for t, c in top_topics]
+
+    # #12 Mapa hierárquico: temas que aparecem JUNTOS no mesmo link se conectam.
+    # Constrói 'Tema ↳ relacionados' a partir da co-ocorrência dos aiTopics.
+    cooc = {}
+    for l in links:
+        ts = list(dict.fromkeys(l.get("aiTopics") or []))
+        for i in range(len(ts)):
+            for j in range(i + 1, len(ts)):
+                a, b = ts[i], ts[j]
+                da = cooc.setdefault(a, {}); da[b] = da.get(b, 0) + 1
+                db = cooc.setdefault(b, {}); db[a] = db.get(a, 0) + 1
+    min_cooc = 2 if total >= 25 else 1
+    tree = []
+    for root, _c in sorted(topic_freq.items(), key=lambda x: -x[1])[:6]:
+        kids = sorted((cooc.get(root) or {}).items(), key=lambda x: -x[1])
+        ch = [{"name": b, "count": cnt} for b, cnt in kids if cnt >= min_cooc][:5]
+        if ch:   # só raízes que de fato conectam a algo
+            tree.append({"name": root, "count": topic_freq[root], "children": ch})
+
     summary = ""
     if _ai_enabled() and total >= 3:
         cats_str = ", ".join(f"{n} ({c})" for n, c in cat_stats[:15])
@@ -1979,7 +1998,7 @@ async def library_map(user=Depends(get_current_user)):
             f"Total: {total} conteúdos.\nCategorias (nome (itens)): {cats_str}\nTemas: {topics_str}"
         )
         summary = await _chat(prompt, 240, models=GEMINI_SMART_MODELS)
-    return {"total": total, "summary": summary, "strengths": strengths, "gaps": gaps, "topics": topics, "orphan": orphan}
+    return {"total": total, "summary": summary, "strengths": strengths, "gaps": gaps, "topics": topics, "orphan": orphan, "tree": tree}
 
 _insights_cache = {}  # uid -> (ts, n_items, result)
 
