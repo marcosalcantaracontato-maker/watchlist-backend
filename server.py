@@ -1796,6 +1796,69 @@ async def library_map(user=Depends(get_current_user)):
         summary = await (_gemini_chat(prompt, 240, models=GEMINI_SMART_MODELS) if GEMINI_KEYS else _ai_text(prompt, 240))
     return {"total": total, "summary": summary, "strengths": strengths, "gaps": gaps, "topics": topics, "orphan": orphan}
 
+_topics_cache = {}  # uid -> (ts, n_items, result) — evita reclusterizar/renomear a cada abertura
+
+@app.get("/api/ai/topics")
+async def ai_topics(user=Depends(get_current_user)):
+    """Temas por SIGNIFICADO: clusteriza os vídeos pelos embeddings (greedy por centroide)
+    e a IA NOMEIA cada grupo (1 chamada só). Retorna no formato dos tópicos do Universo
+    ({name,count,videoIds}). Cacheado ~10min por usuário."""
+    uid = str(user["_id"])
+    links = await db.links.find({"userId": uid}, {"topicEmbedding": 1, "title": 1, "aiTopics": 1}).to_list(8000)
+    items = [l for l in links if l.get("topicEmbedding")]
+    now = datetime.utcnow().timestamp()
+    cache = _topics_cache.get(uid)
+    if cache and now - cache[0] < 600 and cache[1] == len(items):
+        return cache[2]
+    if len(items) < 4:
+        res = {"topics": []}; _topics_cache[uid] = (now, len(items), res); return res
+    THRESH = 0.55
+    clusters = []
+    for l in items:
+        e = l["topicEmbedding"]
+        best, bs = None, -1.0
+        for c in clusters:
+            sim = _cosine(e, c["cen"])
+            if sim > bs:
+                bs, best = sim, c
+        if best and bs >= THRESH:
+            for i in range(len(e)):
+                best["sum"][i] += e[i]
+            best["n"] += 1
+            best["cen"] = [s / best["n"] for s in best["sum"]]
+            best["ids"].append(str(l["_id"])); best["titles"].append(l.get("title", "") or "")
+            for t in (l.get("aiTopics") or []):
+                best["topics"][t] = best["topics"].get(t, 0) + 1
+        else:
+            clusters.append({"sum": list(e), "cen": list(e), "n": 1, "ids": [str(l["_id"])],
+                             "titles": [l.get("title", "") or ""], "topics": {t: 1 for t in (l.get("aiTopics") or [])}})
+    clusters = sorted([c for c in clusters if c["n"] >= 2], key=lambda c: -c["n"])[:14]
+    names = []
+    if clusters and _ai_enabled():
+        lines = []
+        for i, c in enumerate(clusters):
+            tt = ", ".join(t for t, _ in sorted(c["topics"].items(), key=lambda x: -x[1])[:5])
+            ex = "; ".join(s[:50] for s in c["titles"][:3])
+            lines.append(f"{i}: temas=[{tt}] exemplos=[{ex}]")
+        prompt = ("Dê um NOME curto (1 a 3 palavras, em português) para cada GRUPO de conteúdos "
+                  "abaixo, refletindo o tema em comum. Responda APENAS um array JSON de strings, na "
+                  "MESMA ORDEM e quantidade dos grupos.\n" + "\n".join(lines))
+        txt = await (_gemini_chat(prompt, 220, models=GEMINI_SMART_MODELS) if GEMINI_KEYS else _ai_text(prompt, 220))
+        try:
+            m = _re.search(r"\[.*\]", txt, _re.S)
+            if m:
+                names = [str(x).strip()[:30] for x in _json.loads(m.group(0))]
+        except Exception:
+            pass
+    topics = []
+    for i, c in enumerate(clusters):
+        nm = (names[i] if i < len(names) and names[i]
+              else (sorted(c["topics"].items(), key=lambda x: -x[1])[0][0] if c["topics"] else f"Grupo {i + 1}"))
+        topics.append({"name": nm, "count": c["n"], "videoIds": c["ids"]})
+    res = {"topics": topics}
+    _topics_cache[uid] = (now, len(items), res)
+    return res
+
 @app.post("/api/ai/gemini")
 async def ai_gemini_proxy(req: GeminiReq, user=Depends(get_current_user)):
     """Proxy do Gemini com ROTAÇÃO de chaves — usado pela IA do Financeiro (e
