@@ -1583,9 +1583,20 @@ async def _extract_content(url: str, platform: str, video_id: str):
     text = (text or "").strip()[:8000]
     return text, ctype, len(text.split())
 
+async def _summarize(title: str, text: str) -> str:
+    """Resumo objetivo a partir do CONTEÚDO real (artigo/transcrição) — 1 parágrafo + bullets."""
+    prompt = (
+        "Resuma este conteúdo em português, de forma útil e objetiva. Formato:\n"
+        "1) Um parágrafo curto (2-3 frases) explicando do que se trata e a ideia central.\n"
+        "2) 3 a 5 pontos-chave em bullets (cada um começando com \"- \").\n"
+        "Sem saudações, sem enrolação, sem inventar nada além do conteúdo.\n\n"
+        f"TÍTULO: {title}\n\nCONTEÚDO:\n{text[:6000]}"
+    )
+    return await _chat(prompt, 600, temperature=0.3)
+
 async def _enrich_link(link_id: str, user_id: str):
     """Job em background: extrai o CONTEÚDO REAL (1x), gera aiTopics + embedding SOBRE o
-    conteúdo (não só o título), tipo e tempo de leitura. Tudo melhora com isto."""
+    conteúdo (não só o título), resumo, tipo e tempo de leitura. Tudo melhora com isto."""
     if not _ai_enabled():
         return
     try:
@@ -1614,6 +1625,15 @@ async def _enrich_link(link_id: str, user_id: str):
         updates["aiTopics"] = list(dict.fromkeys(topics))   # temas de IA, separados das tags do usuário
     if emb:
         updates["topicEmbedding"] = emb
+    # Resumo automático SOBRE o conteúdo real (não só a descrição). Gerado 1x p/ TODOS.
+    if not doc.get("aiSummary"):
+        base = (content or "").strip()
+        if len(base) < 120:   # pouco/nenhum texto extraído → usa descrição do vídeo
+            base = (base + "\n" + await _yt_description(doc.get("videoId", ""))).strip() if doc.get("videoId") else base
+        if len(base) >= 60:
+            summary = await _summarize(title, base)
+            if summary:
+                updates["aiSummary"] = summary
     try:
         await db.links.update_one({"_id": doc["_id"], "userId": user_id},
                                   {"$set": updates, "$inc": {"aiTries": 1}})
@@ -1660,15 +1680,11 @@ async def ai_summary(link_id: str, user=Depends(get_current_user)):
         raise HTTPException(status_code=404, detail="Link não encontrado")
     if link.get("aiSummary"):
         return {"summary": link["aiSummary"]}
-    desc = await _yt_description(link.get("videoId", ""))
-    prompt = (
-        "Resuma este vídeo em português, de forma útil e objetiva. Formato:\n"
-        "1) Um parágrafo curto explicando do que se trata.\n"
-        "2) 3 a 5 pontos-chave em bullets (cada um começando com \"- \").\n"
-        "Sem saudações, sem enrolação.\n\n"
-        f"TÍTULO: {link.get('title','')}\n\nDESCRIÇÃO:\n{desc[:4000]}"
-    )
-    summary = await _ai_text(prompt, 600)
+    # Prefere o CONTEÚDO real (Fase 1); cai pra descrição do vídeo se não houver texto.
+    base = (link.get("contentText") or "").strip()
+    if len(base) < 120 and link.get("videoId"):
+        base = (base + "\n" + await _yt_description(link.get("videoId", ""))).strip()
+    summary = await _summarize(link.get("title", ""), base) if len(base) >= 60 else ""
     if summary:
         await db.links.update_one({"_id": link["_id"]}, {"$set": {"aiSummary": summary}})
     return {"summary": summary}
@@ -2282,7 +2298,7 @@ async def ai_backfill(background: BackgroundTasks, user=Depends(get_current_user
         return {"ok": False, "reason": "no_key", "remaining": 0}
     uid = str(user["_id"])
     q = {"userId": uid, "$and": [
-        {"$or": [{"aiEnrichedAt": {"$exists": False}}, {"topicEmbedding": {"$exists": False}}, {"contentText": {"$exists": False}}]},
+        {"$or": [{"aiEnrichedAt": {"$exists": False}}, {"topicEmbedding": {"$exists": False}}, {"contentText": {"$exists": False}}, {"aiSummary": {"$exists": False}}]},
         {"$or": [{"aiTries": {"$exists": False}}, {"aiTries": {"$lt": 3}}]},
     ]}
     remaining = await db.links.count_documents(q)
