@@ -301,6 +301,7 @@ def serialize(doc) -> dict:
         return None
     doc["id"] = str(doc.pop("_id"))
     doc.pop("topicEmbedding", None)  # vetor grande — fica só no servidor
+    doc.pop("contentText", None)     # texto extraído (grande) — só no servidor (busca/RAG)
     for k, v in doc.items():
         if isinstance(v, ObjectId):
             doc[k] = str(v)
@@ -1119,7 +1120,7 @@ async def create_link(body: LinkCreate, background: BackgroundTasks, user=Depend
     result = await db.links.insert_one(doc)
     # IA: enriquece tags + embedding em background (se houver chave de IA)
     if _ai_enabled():
-        background.add_task(_enrich_link, str(result.inserted_id), str(user["_id"]), body.title, body.tags)
+        background.add_task(_enrich_link, str(result.inserted_id), str(user["_id"]))
     return {"linkId": str(result.inserted_id)}
 
 @app.patch("/api/links/{link_id}")
@@ -1485,7 +1486,7 @@ async def _ai_embedding(text: str):
     try:
         if GEMINI_KEYS:
             j = await _gemini_post(f"models/{GEMINI_EMBED_MODEL}:embedContent",
-                {"model": f"models/{GEMINI_EMBED_MODEL}", "content": {"parts": [{"text": text[:2000]}]},
+                {"model": f"models/{GEMINI_EMBED_MODEL}", "content": {"parts": [{"text": text[:4000]}]},
                  "outputDimensionality": GEMINI_EMBED_DIMS}, GEMINI_EMBED_MODEL)
             if j:
                 return j["embedding"]["values"]
@@ -1493,7 +1494,7 @@ async def _ai_embedding(text: str):
             async with httpx.AsyncClient(timeout=20) as c:
                 r = await c.post("https://api.openai.com/v1/embeddings",
                     headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
-                    json={"model": OPENAI_EMBED_MODEL, "input": text[:2000]})
+                    json={"model": OPENAI_EMBED_MODEL, "input": text[:4000]})
                 if r.status_code == 200:
                     return r.json()["data"][0]["embedding"]
     except Exception:
@@ -1524,23 +1525,94 @@ async def _yt_description(video_id: str) -> str:
         pass
     return ""
 
-async def _enrich_link(link_id: str, user_id: str, title: str, existing_tags: list):
-    """Job em background: preenche aiTopics[] (TEMAS de conteúdo, gerados por IA —
-    separados das tags do usuário) + topicEmbedding (vetor)."""
+def _html_to_text(html: str) -> str:
+    """Readability simples: foca no <article>/<main>, remove ruído e tags → texto."""
+    import re, html as _h
+    m = (re.search(r"<article[^>]*>(.*?)</article>", html, re.S | re.I)
+         or re.search(r"<main[^>]*>(.*?)</main>", html, re.S | re.I))
+    chunk = m.group(1) if m else html
+    chunk = re.sub(r"<(script|style|nav|header|footer|aside|form|noscript)[^>]*>.*?</\1>", " ", chunk, flags=re.S | re.I)
+    chunk = re.sub(r"<br\s*/?>", "\n", chunk, flags=re.I)
+    chunk = re.sub(r"</(p|div|h[1-6]|li|tr)>", "\n", chunk, flags=re.I)
+    chunk = re.sub(r"<[^>]+>", " ", chunk)
+    chunk = _h.unescape(chunk)
+    chunk = re.sub(r"[ \t]+", " ", chunk)
+    chunk = re.sub(r"\n\s*\n+", "\n\n", chunk)
+    return chunk.strip()
+
+async def _yt_transcript(video_id: str) -> str:
+    """Best-effort: transcrição do vídeo via timedtext (sem OAuth). Vazio se não houver."""
+    if not video_id:
+        return ""
+    try:
+        async with httpx.AsyncClient(timeout=12, follow_redirects=True) as c:
+            r = await c.get(f"https://www.youtube.com/watch?v={video_id}",
+                            headers={"User-Agent": "Mozilla/5.0", "Accept-Language": "pt-BR,pt,en"})
+            urls = _re.findall(r'"baseUrl":"(https://www\.youtube\.com/api/timedtext[^"]+)"', r.text)
+            if not urls:
+                return ""
+            base = urls[0].replace("\\u0026", "&").replace("\\/", "/")
+            tr = await c.get(base)
+            import html as _h
+            parts = _re.findall(r"<text[^>]*>(.*?)</text>", tr.text, _re.S)
+            out = " ".join(_h.unescape(_re.sub(r"<[^>]+>", " ", p)) for p in parts)
+            return _re.sub(r"\s+", " ", out).strip()
+    except Exception:
+        return ""
+
+async def _extract_content(url: str, platform: str, video_id: str):
+    """Texto REAL do conteúdo (o multiplicador): YouTube→transcrição (senão descrição);
+    página→texto principal (readability). Retorna (texto, tipo, nº_palavras)."""
+    text, ctype = "", "web"
+    try:
+        if platform == "youtube" or video_id:
+            ctype = "vídeo"
+            text = (await _yt_transcript(video_id)) or (await _yt_description(video_id)) or ""
+        elif url:
+            async with httpx.AsyncClient(timeout=12, follow_redirects=True) as c:
+                r = await c.get(url, headers={"User-Agent": "Mozilla/5.0 (compatible; WatchListBot/1.0)"})
+                text = _html_to_text(r.text[:500000])
+                low = url.lower()
+                if any(s in low for s in ("medium.", "substack", "/blog", "/article", "news", "dev.to")): ctype = "artigo"
+                elif any(s in low for s in ("linkedin.", "twitter.", "x.com", "instagram.", "tiktok.", "reddit.")): ctype = "post"
+    except Exception:
+        pass
+    text = (text or "").strip()[:8000]
+    return text, ctype, len(text.split())
+
+async def _enrich_link(link_id: str, user_id: str):
+    """Job em background: extrai o CONTEÚDO REAL (1x), gera aiTopics + embedding SOBRE o
+    conteúdo (não só o título), tipo e tempo de leitura. Tudo melhora com isto."""
     if not _ai_enabled():
         return
-    topics = await _ai_tags(title)
-    emb = await _ai_embedding((title or "") + " " + " ".join(topics))
-    updates = {"aiEnrichedAt": datetime.utcnow()}
+    try:
+        doc = await db.links.find_one({"_id": ObjectId(link_id), "userId": user_id})
+    except Exception:
+        doc = None
+    if not doc:
+        return
+    title = doc.get("title", "") or ""
+    content = doc.get("contentText")
+    ctype = doc.get("contentType")
+    words = doc.get("contentWords")
+    if content is None:   # extrai uma vez (depois fica salvo)
+        content, ctype, words = await _extract_content(doc.get("url", ""), doc.get("platform", ""), doc.get("videoId", ""))
+    snippet = (content or "")[:1500]
+    topics = await _ai_tags(title + (("\n" + snippet) if snippet else ""))
+    emb = await _ai_embedding((title + "\n" + (content or "")).strip())
+    updates = {
+        "aiEnrichedAt": datetime.utcnow(),
+        "contentText": content or "",
+        "contentType": ctype or "web",
+        "contentWords": words or 0,
+        "readingTimeMin": max(1, round((words or 0) / 200)),
+    }
     if topics:
-        # Temas de IA ficam em campo PRÓPRIO — nunca poluem link.tags (curadoria do usuário).
-        updates["aiTopics"] = list(dict.fromkeys(topics))
+        updates["aiTopics"] = list(dict.fromkeys(topics))   # temas de IA, separados das tags do usuário
     if emb:
         updates["topicEmbedding"] = emb
     try:
-        # aiTries++ a cada tentativa → o backfill desiste após N tentativas (evita
-        # reprocessar para sempre quando a IA não consegue extrair nada/cota off).
-        await db.links.update_one({"_id": ObjectId(link_id), "userId": user_id},
+        await db.links.update_one({"_id": doc["_id"], "userId": user_id},
                                   {"$set": updates, "$inc": {"aiTries": 1}})
     except Exception:
         pass
@@ -1997,13 +2069,13 @@ async def ai_backfill(background: BackgroundTasks, user=Depends(get_current_user
         return {"ok": False, "reason": "no_key", "remaining": 0}
     uid = str(user["_id"])
     q = {"userId": uid, "$and": [
-        {"$or": [{"aiEnrichedAt": {"$exists": False}}, {"topicEmbedding": {"$exists": False}}]},
+        {"$or": [{"aiEnrichedAt": {"$exists": False}}, {"topicEmbedding": {"$exists": False}}, {"contentText": {"$exists": False}}]},
         {"$or": [{"aiTries": {"$exists": False}}, {"aiTries": {"$lt": 3}}]},
     ]}
     remaining = await db.links.count_documents(q)
-    pending = await db.links.find(q).limit(60).to_list(60)   # lote por chamada
+    pending = await db.links.find(q).limit(40).to_list(40)   # lote por chamada (extração é mais pesada)
     for l in pending:
-        background.add_task(_enrich_link, str(l["_id"]), uid, l.get("title", ""), l.get("tags", []))
+        background.add_task(_enrich_link, str(l["_id"]), uid)
     return {"ok": True, "queued": len(pending), "remaining": remaining}
 
 # ─── METADATA FETCH ──────────────────────────────────────────────────────────
