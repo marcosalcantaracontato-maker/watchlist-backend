@@ -1656,20 +1656,25 @@ async def semantic_search(req: SearchReq, user=Depends(get_current_user)):
         return {"semantic": False, "results": []}
     uid = str(user["_id"])
     docs = await db.links.find({"userId": uid}).to_list(8000)
+    by_id = {str(d["_id"]): d for d in docs}
+    def _fmt(did, score):
+        d = by_id[did]
+        thumb = d.get("rawThumb") or (f"https://img.youtube.com/vi/{d.get('videoId')}/hqdefault.jpg" if d.get("videoId") else "")
+        return {"id": did, "score": round(score, 3), "title": d.get("title", ""), "url": d.get("url", ""),
+                "thumb": thumb, "videoId": d.get("videoId", ""), "platform": d.get("platform", "other")}
     emb = await _ai_embedding(q)
     if not emb:
         ql = q.lower()
         hits = [str(d["_id"]) for d in docs
                 if ql in (d.get("title", "") + " " + " ".join(d.get("tags", []) or []) + " " + " ".join(d.get("aiTopics", []) or [])).lower()]
-        return {"semantic": False, "results": [{"id": i, "score": 1.0} for i in hits[:req.limit]]}
+        return {"semantic": False, "results": [_fmt(i, 1.0) for i in hits[:req.limit]]}
     sims = []
     for d in docs:
         e = d.get("topicEmbedding")
         if e:
             sims.append((str(d["_id"]), _cosine(emb, e)))
     sims.sort(key=lambda x: -x[1])
-    top = [{"id": i, "score": round(s, 3)} for i, s in sims[:req.limit] if s > 0.22]
-    return {"semantic": True, "results": top}
+    return {"semantic": True, "results": [_fmt(i, s) for i, s in sims[:req.limit] if s > 0.22]}
 
 @app.post("/api/ai/suggest-category")
 async def suggest_category(req: SuggestCatReq, user=Depends(get_current_user)):
