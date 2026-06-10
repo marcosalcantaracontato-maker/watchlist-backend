@@ -327,6 +327,10 @@ class SuggestCatReq(BaseModel):
     url: str = ""
     description: str = ""
 
+class SuggestTagsReq(BaseModel):
+    title: str = ""
+    url: str = ""
+
 class LinkCreate(BaseModel):
     url:        str
     title:      str
@@ -1549,22 +1553,33 @@ async def suggest_category(req: SuggestCatReq, user=Depends(get_current_user)):
         while p and p in by_id and seen < 12:
             parts.insert(0, by_id[p].get("name", "")); p = by_id[p].get("parentId"); seen += 1
         return " › ".join(parts)
-    existing = [{"id": cid, "path": path(c)} for cid, c in by_id.items()]
-    listing = "\n".join(f'- [{e["id"]}] {e["path"]}' for e in existing[:150]) or "(nenhuma ainda)"
+    counts = {}
+    async for d in db.links.find({"userId": uid}, {"categoryId": 1}):
+        cid = d.get("categoryId")
+        if cid:
+            counts[cid] = counts.get(cid, 0) + 1
+    rows = [f'- [{cid}] {path(c)} ({counts.get(cid, 0)} itens)' for cid, c in by_id.items()]
+    listing = "\n".join(rows[:150]) or "(nenhuma ainda)"
     desc = (req.description or "")[:600]
     prompt = (
-        "Você organiza uma biblioteca de conteúdos numa ÁRVORE de categorias (profundidade "
-        "ilimitada). Analise TODA a hierarquia abaixo (cada linha mostra o caminho completo "
-        "Mãe › Filha › Neta…) e decida o lugar MAIS ESPECÍFICO para o conteúdo:\n"
-        "1) Se já existe uma categoria/subcategoria adequada (em QUALQUER nível), use-a (matchId).\n"
-        "2) Senão, proponha UMA nova categoria curta (1–3 palavras) e ANINHE-A no nó existente "
-        "mais específico que se aplica (newParentId) — prefira criar uma sub/sub-sub dentro de "
-        "uma existente a criar uma categoria principal solta, quando fizer sentido.\n"
-        "3) Só crie categoria PRINCIPAL (newParentId null) se realmente for um tema novo de topo.\n"
-        "Responda APENAS um JSON em uma linha, sem texto extra:\n"
-        '{"matchId": "<id existente ou null>", "newName": "<nome da nova ou null>", '
-        '"newParentId": "<id do pai da nova (pode ser um nó profundo) ou null>", "reason": "<curto>"}\n\n'
-        f"ÁRVORE DE CATEGORIAS (id › caminho completo):\n{listing}\n\n"
+        "Você é um bibliotecário organizando uma ÁRVORE de categorias (profundidade ilimitada). "
+        "Uma boa categoria AGRUPA vários conteúdos do mesmo assunto — nunca é feita para um único "
+        "item. Decida o lugar CERTO para o conteúdo abaixo, nesta ordem de preferência:\n\n"
+        "1) REUTILIZAR (melhor opção): se já existe categoria/subcategoria adequada em QUALQUER "
+        "nível, use-a (matchId). Na dúvida entre reutilizar e criar, REUTILIZE.\n"
+        "2) Só se nada servir, CRIE UMA, escolhendo o nível pela ABRANGÊNCIA do assunto:\n"
+        "   • PRINCIPAL (newParentId null) → tema amplo e novo, não coberto por nenhuma existente.\n"
+        "   • SUB / SUB-SUB (newParentId = nó existente) → faceta MAIS específica de uma existente.\n\n"
+        "NÃO faça (evite poluir a árvore):\n"
+        "- criar categoria 'prima' quase igual a uma existente (ex.: 'IA' se já há 'Inteligência Artificial');\n"
+        "- criar sub/sub-sub granular demais que provavelmente terá só este item;\n"
+        "- aninhar fundo sem necessidade, nem deixar tudo na raiz.\n"
+        "A categoria nova deve ser ampla o bastante para reunir vários conteúdos futuros parecidos. "
+        "Use a contagem de itens como dica de quais categorias são agrupamentos reais.\n\n"
+        "Responda APENAS um JSON em uma linha:\n"
+        '{"matchId": "<id existente ou null>", "newName": "<nome curto da nova ou null>", '
+        '"newParentId": "<id do pai (pode ser nó profundo) ou null>", "reason": "<por que esse nível>"}\n\n'
+        f"ÁRVORE (id › caminho completo (nº de itens)):\n{listing}\n\n"
         f"CONTEÚDO:\nTítulo: {title}\nURL: {(req.url or '')[:200]}\n"
         + (f"Descrição: {desc}\n" if desc else "")
     )
@@ -1586,6 +1601,43 @@ async def suggest_category(req: SuggestCatReq, user=Depends(get_current_user)):
     # nome legível do match (p/ o front exibir sem recalcular)
     out["matchPath"] = path(by_id[out["matchId"]]) if out["matchId"] else None
     return out
+
+@app.post("/api/ai/suggest-tags")
+async def suggest_tags(req: SuggestTagsReq, user=Depends(get_current_user)):
+    """Sugere TAGS de usuário (estilo curadoria) para o conteúdo, REUTILIZANDO o
+    vocabulário de tags que o usuário já usa (consistência) + novas se preciso.
+    O usuário aceita por clique (não entra automático)."""
+    uid = str(user["_id"])
+    title = (req.title or "").strip()[:240]
+    if not _ai_enabled() or not title:
+        return {"tags": []}
+    vocab = set()
+    async for l in db.links.find({"userId": uid}, {"tags": 1}).limit(3000):
+        for t in (l.get("tags") or []):
+            if t: vocab.add(str(t))
+    vlist = list(vocab)[:140]
+    prompt = (
+        "Sugira de 3 a 6 TAGS curtas (1–2 palavras, minúsculas) para o conteúdo, no estilo de "
+        "curadoria pessoal (assunto/uso/nicho). PREFIRA reutilizar tags que o usuário JÁ usa "
+        "quando couberem; complemente com novas só se necessário. Sem # e sem repetir.\n"
+        "Responda APENAS um array JSON de strings. Ex.: [\"marketing\",\"tráfego pago\",\"iniciante\"]\n\n"
+        f"TAGS JÁ USADAS PELO USUÁRIO: {', '.join(vlist) if vlist else '(nenhuma ainda)'}\n"
+        f"Título: {title}\nURL: {(req.url or '')[:200]}"
+    )
+    txt = await _ai_text(prompt, 120)
+    tags = []
+    try:
+        m = _re.search(r"\[.*\]", txt, _re.S)
+        if m:
+            arr = _json.loads(m.group(0))
+            seen = set()
+            for t in arr:
+                s = str(t).strip().lower()[:28]
+                if s and s not in seen:
+                    seen.add(s); tags.append(s)
+    except Exception:
+        pass
+    return {"tags": tags[:6]}
 
 @app.post("/api/ai/gemini")
 async def ai_gemini_proxy(req: GeminiReq, user=Depends(get_current_user)):
