@@ -128,10 +128,14 @@ _GEN_NO_THINK = {"thinkingConfig": {"thinkingBudget": 0}}
 async def _gemini_chat(prompt: str, max_tokens: int, temperature: float = 0.3, timeout: float = 35, models=None):
     """Geração de texto com FALLBACK de modelos: tenta cada modelo de `models` (default
     GEMINI_CHAT_MODELS), cada um rotacionando as chaves, até obter TEXTO. Robusto a cota
-    diária por modelo. Retorna o texto (str) ou '' se nada funcionar."""
-    body = {"contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"temperature": temperature, "maxOutputTokens": max_tokens, **_GEN_NO_THINK}}
+    diária por modelo. Retorna o texto (str) ou '' se nada funcionar.
+    IMPORTANTE: `thinkingConfig` só existe nos modelos 2.5 — enviá-lo a 2.0/1.5 dá 400 e
+    QUEBRA o fallback. Por isso o body é montado POR MODELO."""
     for model in (models or GEMINI_CHAT_MODELS):
+        gen = {"temperature": temperature, "maxOutputTokens": max_tokens}
+        if "2.5" in model:
+            gen["thinkingConfig"] = {"thinkingBudget": 0}   # 2.5 pensa e come os tokens → desliga
+        body = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": gen}
         j = await _gemini_post(f"models/{model}:generateContent", body, model, timeout=timeout)
         if j:
             txt = _gemini_text(j)
