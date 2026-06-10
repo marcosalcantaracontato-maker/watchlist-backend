@@ -318,6 +318,15 @@ class GeminiReq(BaseModel):
     model: Optional[str] = None
     body: dict = {}
 
+class SearchReq(BaseModel):
+    q: str = ""
+    limit: int = 40
+
+class SuggestCatReq(BaseModel):
+    title: str = ""
+    url: str = ""
+    description: str = ""
+
 class LinkCreate(BaseModel):
     url:        str
     title:      str
@@ -1491,6 +1500,84 @@ async def ai_bridge(body: BridgeReq, user=Depends(get_current_user)):
     )
     text = await _ai_text(prompt, 300)
     return {"suggestion": text}
+
+def _cosine(a, b) -> float:
+    s = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a)); nb = math.sqrt(sum(x * x for x in b))
+    return s / (na * nb) if na and nb else 0.0
+
+@app.post("/api/links/search")
+async def semantic_search(req: SearchReq, user=Depends(get_current_user)):
+    """Busca SEMÂNTICA: embeda a query e ranqueia os links do usuário por similaridade
+    de cosseno com o topicEmbedding. Sem IA/sem vetor → cai p/ busca textual simples."""
+    q = (req.q or "").strip()
+    if not q:
+        return {"semantic": False, "results": []}
+    uid = str(user["_id"])
+    docs = await db.links.find({"userId": uid}).to_list(8000)
+    emb = await _ai_embedding(q)
+    if not emb:
+        ql = q.lower()
+        hits = [str(d["_id"]) for d in docs
+                if ql in (d.get("title", "") + " " + " ".join(d.get("tags", []) or []) + " " + " ".join(d.get("aiTopics", []) or [])).lower()]
+        return {"semantic": False, "results": [{"id": i, "score": 1.0} for i in hits[:req.limit]]}
+    sims = []
+    for d in docs:
+        e = d.get("topicEmbedding")
+        if e:
+            sims.append((str(d["_id"]), _cosine(emb, e)))
+    sims.sort(key=lambda x: -x[1])
+    top = [{"id": i, "score": round(s, 3)} for i, s in sims[:req.limit] if s > 0.22]
+    return {"semantic": True, "results": top}
+
+@app.post("/api/ai/suggest-category")
+async def suggest_category(req: SuggestCatReq, user=Depends(get_current_user)):
+    """Sugere, para um conteúdo novo, a MELHOR categoria EXISTENTE ou propõe UMA nova
+    (com pai opcional). O usuário decide usar a sugestão ou fazer manual."""
+    uid = str(user["_id"])
+    title = (req.title or "").strip()[:240]
+    if not _ai_enabled() or not title:
+        return {"matchId": None, "newName": None, "newParentId": None, "reason": ""}
+    cats = await db.categories.find({"userId": uid}).to_list(2000)
+    by_id = {str(c["_id"]): c for c in cats}
+    def path(c):
+        parts = [c.get("name", "")]; p = c.get("parentId")
+        seen = 0
+        while p and p in by_id and seen < 12:
+            parts.insert(0, by_id[p].get("name", "")); p = by_id[p].get("parentId"); seen += 1
+        return " › ".join(parts)
+    existing = [{"id": cid, "path": path(c)} for cid, c in by_id.items()]
+    listing = "\n".join(f'- [{e["id"]}] {e["path"]}' for e in existing[:150]) or "(nenhuma ainda)"
+    desc = (req.description or "")[:600]
+    prompt = (
+        "Você organiza uma biblioteca de conteúdos em categorias (árvore). Para o conteúdo "
+        "abaixo, escolha a MELHOR categoria EXISTENTE se houver uma adequada; senão proponha "
+        "UMA nova categoria curta (1–3 palavras) — opcionalmente aninhada sob uma existente.\n"
+        "Responda APENAS um JSON em uma linha, sem texto extra, no formato:\n"
+        '{"matchId": "<id de uma existente ou null>", "newName": "<nome da nova ou null>", '
+        '"newParentId": "<id do pai da nova ou null>", "reason": "<motivo curto>"}\n\n'
+        f"CATEGORIAS EXISTENTES (id › caminho):\n{listing}\n\n"
+        f"CONTEÚDO:\nTítulo: {title}\nURL: {(req.url or '')[:200]}\n"
+        + (f"Descrição: {desc}\n" if desc else "")
+    )
+    txt = await _ai_text(prompt, 220)
+    out = {"matchId": None, "newName": None, "newParentId": None, "reason": ""}
+    try:
+        m = _re.search(r"\{.*\}", txt, _re.S)
+        if m:
+            data = _json.loads(m.group(0))
+            mid = data.get("matchId")
+            out["matchId"] = mid if (isinstance(mid, str) and mid in by_id) else None
+            nn = data.get("newName")
+            out["newName"] = (str(nn).strip()[:40] or None) if (nn and not out["matchId"]) else None
+            npid = data.get("newParentId")
+            out["newParentId"] = npid if (isinstance(npid, str) and npid in by_id and out["newName"]) else None
+            out["reason"] = str(data.get("reason") or "")[:160]
+    except Exception:
+        pass
+    # nome legível do match (p/ o front exibir sem recalcular)
+    out["matchPath"] = path(by_id[out["matchId"]]) if out["matchId"] else None
+    return out
 
 @app.post("/api/ai/gemini")
 async def ai_gemini_proxy(req: GeminiReq, user=Depends(get_current_user)):
