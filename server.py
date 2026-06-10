@@ -1320,6 +1320,49 @@ async def home_layout(user=Depends(get_current_user)):
                 "data_source": {"kind": "ids", "ids": top},
             })
 
+    # ── "Segundo cérebro": trilha, ângulo oposto, esquecidos, duplicados ──
+    emb_items = [l for l in valid if l.get("topicEmbedding")]
+    watched_seeds = [l for l in emb_items if (l.get("watched") or _progress_pct(l) >= 50)]
+    unwatched = [l for l in emb_items if _video_status(l) == "not_started"]
+
+    def _add(sid, title, subtitle, ids):
+        nonlocal order
+        ids = list(dict.fromkeys(ids))[:14]
+        if len(ids) >= 3:
+            sections.append({"id": sid, "type": "ai_reco", "order": order, "title": title,
+                             "subtitle": subtitle, "data_source": {"kind": "ids", "ids": ids}})
+            order += 1
+
+    if watched_seeds and len(unwatched) >= 3:
+        dim = len(watched_seeds[0]["topicEmbedding"])
+        cen = [0.0] * dim
+        for l in watched_seeds:
+            e = l["topicEmbedding"]
+            for i in range(min(dim, len(e))):
+                cen[i] += e[i]
+        cen = [x / len(watched_seeds) for x in cen]
+        scored = sorted(((_cosine(cen, l["topicEmbedding"]), str(l["_id"])) for l in unwatched), reverse=True)
+        # Continue a trilha: não-assistidos MAIS próximos do que você já viu.
+        _add("trilha", "Continue sua trilha", "próximos passos no que você vem estudando",
+             [lid for sc, lid in scored if sc > 0.32])
+        # Ângulo oposto: os MENOS parecidos (sair da bolha).
+        _add("oposto", "Explore um ângulo diferente", "fora da sua bolha — amplie horizontes",
+             [lid for sc, lid in reversed(scored) if sc < 0.20])
+
+    # Esquecidos: salvos há tempo e nunca vistos.
+    forgotten = sorted([l for l in valid if _video_status(l) == "not_started" and _days_since(l) > 60],
+                       key=_days_since, reverse=True)
+    _add("esquecidos", "Esquecidos", "salvos há tempos e nunca vistos", [str(l["_id"]) for l in forgotten])
+
+    # Duplicados: pares quase idênticos (cosseno > 0.93). Amostra capada p/ latência.
+    pool = emb_items[:180]
+    dup = []
+    for i in range(len(pool)):
+        for j in range(i + 1, len(pool)):
+            if _cosine(pool[i]["topicEmbedding"], pool[j]["topicEmbedding"]) > 0.93:
+                dup.append(str(pool[i]["_id"])); dup.append(str(pool[j]["_id"]))
+    _add("dups", "Possíveis duplicados", "conteúdos muito parecidos — vale revisar", dup)
+
     user_state = "new" if len(links) < 3 else "returning"
     return {"version": 1, "user_state": user_state, "generated_at": datetime.utcnow().isoformat(), "sections": sections}
 
