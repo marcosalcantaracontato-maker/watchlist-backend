@@ -2030,6 +2030,34 @@ async def ai_insights(user=Depends(get_current_user)):
         if c >= 3 and r >= 2 and r / c >= 0.5:
             rising = (t, r, c); break
 
+    # Linha do tempo intelectual: agrupa por período (granularidade conforme o alcance
+    # dos dados) e acha o tema dominante de cada um — usa a DATA DE SALVAMENTO (quando
+    # VOCÊ se interessou), que reflete melhor a evolução dos seus interesses.
+    _MESES = ["jan", "fev", "mar", "abr", "mai", "jun", "jul", "ago", "set", "out", "nov", "dez"]
+    dated = [(_dt(l), l.get("aiTopics") or []) for l in links if _dt(l)]
+    timeline = []
+    if len(dated) >= 6:
+        dts = [d for d, _ in dated]
+        span = (max(dts) - min(dts)).days
+        if span > 540:      # > ~18 meses → por ano
+            keyf, labf = (lambda d: f"{d.year:04d}"), (lambda d: f"{d.year}")
+        elif span > 120:    # > ~4 meses → por trimestre
+            keyf, labf = (lambda d: f"{d.year:04d}-{(d.month-1)//3:01d}"), (lambda d: f"T{(d.month-1)//3+1} {d.year}")
+        else:               # curto → por mês
+            keyf, labf = (lambda d: f"{d.year:04d}-{d.month:02d}"), (lambda d: f"{_MESES[d.month-1]}/{d.year}")
+        buckets = {}
+        for d, topics in dated:
+            k = keyf(d)
+            b = buckets.setdefault(k, {"label": labf(d), "n": 0, "topics": {}})
+            b["n"] += 1
+            for t in topics:
+                b["topics"][t] = b["topics"].get(t, 0) + 1
+        for k in sorted(buckets):
+            b = buckets[k]
+            top = sorted(b["topics"].items(), key=lambda x: -x[1])[:2]
+            timeline.append({"period": k, "label": b["label"], "count": b["n"],
+                             "top": [{"name": t, "count": c} for t, c in top]})
+
     # Plataforma dominante
     plat_freq = {}
     for l in links:
@@ -2062,6 +2090,11 @@ async def ai_insights(user=Depends(get_current_user)):
     other_topics = ", ".join(f"{t} ({c})" for t, c in top_topics[1:8])
     if other_topics:
         facts.append(f"Outros temas: {other_topics}.")
+    # Evolução temporal: só se houver >=2 períodos com tema dominante
+    evo = [p for p in timeline if p["top"]]
+    if len(evo) >= 2:
+        seq = " → ".join(f"{p['label']}: {p['top'][0]['name']}" for p in evo)
+        facts.append(f"Evolução dos interesses ao longo do tempo (período: tema dominante): {seq}.")
 
     insights = []
     if _ai_enabled():
@@ -2096,7 +2129,7 @@ async def ai_insights(user=Depends(get_current_user)):
         if small and dominant:
             insights.append({"icon": "🔍", "text": f"Muito '{dominant[0]}', mas só {small[1]} sobre '{small[0]}' — um ponto a explorar."})
 
-    result = {"insights": insights[:5], "total": total,
+    result = {"insights": insights[:5], "total": total, "timeline": timeline,
               "stats": {"week": week_count, "month": month_count, "watched": watched, "backlog": backlog, "deep": deep}}
     _insights_cache[uid] = (now.timestamp(), total, result)
     return result
