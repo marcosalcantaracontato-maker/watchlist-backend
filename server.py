@@ -125,19 +125,23 @@ def _gemini_text(j: dict) -> str:
 # e voltam sem texto). Mesclado no generationConfig das chamadas de texto.
 _GEN_NO_THINK = {"thinkingConfig": {"thinkingBudget": 0}}
 
-async def _gemini_chat(prompt: str, max_tokens: int, temperature: float = 0.3, timeout: float = 35):
-    """Geração de texto com FALLBACK de modelos: tenta cada modelo de GEMINI_CHAT_MODELS
-    (cada um rotacionando as chaves) até obter TEXTO. Robusto a cota diária por modelo.
-    Retorna o texto (str) ou '' se nada funcionar."""
+async def _gemini_chat(prompt: str, max_tokens: int, temperature: float = 0.3, timeout: float = 35, models=None):
+    """Geração de texto com FALLBACK de modelos: tenta cada modelo de `models` (default
+    GEMINI_CHAT_MODELS), cada um rotacionando as chaves, até obter TEXTO. Robusto a cota
+    diária por modelo. Retorna o texto (str) ou '' se nada funcionar."""
     body = {"contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {"temperature": temperature, "maxOutputTokens": max_tokens, **_GEN_NO_THINK}}
-    for model in GEMINI_CHAT_MODELS:
+    for model in (models or GEMINI_CHAT_MODELS):
         j = await _gemini_post(f"models/{model}:generateContent", body, model, timeout=timeout)
         if j:
             txt = _gemini_text(j)
             if txt:
                 return txt
     return ""
+
+# Modelos para DECISÕES que exigem nuance (categoria/tags sugeridas ao usuário):
+# começa por um modelo mais forte e cai pros menores. Dedup com a lista padrão.
+GEMINI_SMART_MODELS = list(dict.fromkeys(["gemini-2.5-flash", "gemini-2.0-flash"] + GEMINI_CHAT_MODELS))
 try:
     import stripe
     if STRIPE_SECRET_KEY:
@@ -330,6 +334,7 @@ class SuggestCatReq(BaseModel):
 class SuggestTagsReq(BaseModel):
     title: str = ""
     url: str = ""
+    description: str = ""
 
 class LinkCreate(BaseModel):
     url:        str
@@ -1605,28 +1610,32 @@ async def suggest_category(req: SuggestCatReq, user=Depends(get_current_user)):
     listing = "\n".join(rows[:150]) or "(nenhuma ainda)"
     desc = (req.description or "")[:600]
     prompt = (
-        "Você é um bibliotecário organizando uma ÁRVORE de categorias (profundidade ilimitada). "
-        "Uma boa categoria AGRUPA vários conteúdos do mesmo assunto — nunca é feita para um único "
-        "item. Decida o lugar CERTO para o conteúdo abaixo, nesta ordem de preferência:\n\n"
-        "1) REUTILIZAR (melhor opção): se já existe categoria/subcategoria adequada em QUALQUER "
-        "nível, use-a (matchId). Na dúvida entre reutilizar e criar, REUTILIZE.\n"
+        "Você é um bibliotecário organizando uma ÁRVORE de categorias (profundidade ilimitada).\n\n"
+        "PRIMEIRO entenda o que o conteúdo REALMENTE é: qual o seu ASSUNTO e a sua NATUREZA/uso "
+        "(é uma ferramenta? um app? um tutorial? um artigo? um produto? sobre o quê?). NÃO classifique "
+        "por palavras soltas do título. Exemplo de erro a evitar: uma FERRAMENTA de design que usa IA "
+        "NÃO é um 'Agente de IA' — é uma ferramenta de design; case pelo SIGNIFICADO e USO real, não "
+        "pela mera presença da palavra 'IA' no nome.\n\n"
+        "Uma boa categoria AGRUPA vários conteúdos do mesmo assunto — nunca é feita para um único item. "
+        "Decida o lugar CERTO, nesta ordem de preferência:\n"
+        "1) REUTILIZAR: se já existe categoria/subcategoria adequada (em qualquer nível) que combine "
+        "com o ASSUNTO/USO real, use-a (matchId). Na dúvida entre reutilizar e criar, REUTILIZE.\n"
         "2) Só se nada servir, CRIE UMA, escolhendo o nível pela ABRANGÊNCIA do assunto:\n"
         "   • PRINCIPAL (newParentId null) → tema amplo e novo, não coberto por nenhuma existente.\n"
         "   • SUB / SUB-SUB (newParentId = nó existente) → faceta MAIS específica de uma existente.\n\n"
-        "NÃO faça (evite poluir a árvore):\n"
-        "- criar categoria 'prima' quase igual a uma existente (ex.: 'IA' se já há 'Inteligência Artificial');\n"
-        "- criar sub/sub-sub granular demais que provavelmente terá só este item;\n"
-        "- aninhar fundo sem necessidade, nem deixar tudo na raiz.\n"
-        "A categoria nova deve ser ampla o bastante para reunir vários conteúdos futuros parecidos. "
-        "Use a contagem de itens como dica de quais categorias são agrupamentos reais.\n\n"
+        "NÃO faça: categoria 'prima' quase igual a uma existente; sub/sub-sub granular que terá só "
+        "este item; aninhar fundo sem necessidade; nem deixar tudo na raiz. Use a contagem de itens "
+        "como dica de quais categorias são agrupamentos reais. No 'reason', explique em 1 frase o que "
+        "o conteúdo é e por que esse lugar.\n\n"
         "Responda APENAS um JSON em uma linha:\n"
         '{"matchId": "<id existente ou null>", "newName": "<nome curto da nova ou null>", '
-        '"newParentId": "<id do pai (pode ser nó profundo) ou null>", "reason": "<por que esse nível>"}\n\n'
+        '"newParentId": "<id do pai (pode ser nó profundo) ou null>", "reason": "<o que é + por quê>"}\n\n'
         f"ÁRVORE (id › caminho completo (nº de itens)):\n{listing}\n\n"
         f"CONTEÚDO:\nTítulo: {title}\nURL: {(req.url or '')[:200]}\n"
         + (f"Descrição: {desc}\n" if desc else "")
     )
-    txt = await _ai_text(prompt, 220)
+    txt = await (_gemini_chat(prompt, 260, temperature=0.2, models=GEMINI_SMART_MODELS) if GEMINI_KEYS
+                 else _ai_text(prompt, 260))
     out = {"matchId": None, "newName": None, "newParentId": None, "reason": ""}
     try:
         m = _re.search(r"\{.*\}", txt, _re.S)
@@ -1659,15 +1668,19 @@ async def suggest_tags(req: SuggestTagsReq, user=Depends(get_current_user)):
         for t in (l.get("tags") or []):
             if t: vocab.add(str(t))
     vlist = list(vocab)[:140]
+    desc = (req.description or "")[:500]
     prompt = (
-        "Sugira de 3 a 6 TAGS curtas (1–2 palavras, minúsculas) para o conteúdo, no estilo de "
-        "curadoria pessoal (assunto/uso/nicho). PREFIRA reutilizar tags que o usuário JÁ usa "
-        "quando couberem; complemente com novas só se necessário. Sem # e sem repetir.\n"
+        "Entenda o que o conteúdo REALMENTE é (assunto + natureza/uso) e sugira de 3 a 6 TAGS curtas "
+        "(1–2 palavras, minúsculas) no estilo de curadoria pessoal (assunto/uso/nicho). Não derive tag "
+        "de palavra solta do título; reflita o conteúdo real. PREFIRA reutilizar tags que o usuário JÁ "
+        "usa quando couberem; complemente com novas só se necessário. Sem # e sem repetir.\n"
         "Responda APENAS um array JSON de strings. Ex.: [\"marketing\",\"tráfego pago\",\"iniciante\"]\n\n"
         f"TAGS JÁ USADAS PELO USUÁRIO: {', '.join(vlist) if vlist else '(nenhuma ainda)'}\n"
-        f"Título: {title}\nURL: {(req.url or '')[:200]}"
+        f"Título: {title}\nURL: {(req.url or '')[:200]}\n"
+        + (f"Descrição: {desc}\n" if desc else "")
     )
-    txt = await _ai_text(prompt, 120)
+    txt = await (_gemini_chat(prompt, 140, temperature=0.3, models=GEMINI_SMART_MODELS) if GEMINI_KEYS
+                 else _ai_text(prompt, 140))
     tags = []
     try:
         m = _re.search(r"\[.*\]", txt, _re.S)
@@ -1780,12 +1793,15 @@ async def fetch_metadata(request: Request, body: dict):
                 r = await c.get(f"https://www.youtube.com/oembed?url={url}&format=json")
                 if r.status_code == 200:
                     d = r.json()
-                    dur = await _yt_duration(_yt_video_id(url))
+                    vid = _yt_video_id(url)
+                    dur = await _yt_duration(vid)
+                    ydesc = await _yt_description(vid)
                     return {
-                        "title":     d.get("title", ""),
-                        "thumbnail": d.get("thumbnail_url", ""),
-                        "platform":  "youtube",
-                        "author":    d.get("author_name", ""),
+                        "title":       d.get("title", ""),
+                        "thumbnail":   d.get("thumbnail_url", ""),
+                        "description": (ydesc or "")[:500],
+                        "platform":    "youtube",
+                        "author":      d.get("author_name", ""),
                         "durationSeconds": dur,
                     }
         except:
@@ -1809,11 +1825,18 @@ async def fetch_metadata(request: Request, body: dict):
                 import re
                 m = re.search(r"<title[^>]*>([^<]+)</title>", html, re.I)
                 title = m.group(1).strip() if m else ""
-            
+            # descrição (og:description ou <meta name=description>) → ajuda a IA a
+            # entender o que o conteúdo REALMENTE é (categoria/tags melhores).
+            import re as _re2
+            desc = og("description") or ""
+            if not desc:
+                m = _re2.search(r'<meta[^>]+name=["\']description["\'][^>]+content=["\']([^"\']+)', html, _re2.I)
+                desc = m.group(1).strip() if m else ""
             return {
-                "title":     title,
-                "thumbnail": og("image"),
-                "platform":  "other"
+                "title":       title,
+                "thumbnail":   og("image"),
+                "description": desc[:500],
+                "platform":    "other"
             }
     except Exception as e:
         return {"title": "", "thumbnail": "", "platform": "other", "error": str(e)}
