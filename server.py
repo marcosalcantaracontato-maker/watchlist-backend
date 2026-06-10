@@ -1426,7 +1426,10 @@ async def _enrich_link(link_id: str, user_id: str, title: str, existing_tags: li
     if emb:
         updates["topicEmbedding"] = emb
     try:
-        await db.links.update_one({"_id": ObjectId(link_id), "userId": user_id}, {"$set": updates})
+        # aiTries++ a cada tentativa → o backfill desiste após N tentativas (evita
+        # reprocessar para sempre quando a IA não consegue extrair nada/cota off).
+        await db.links.update_one({"_id": ObjectId(link_id), "userId": user_id},
+                                  {"$set": updates, "$inc": {"aiTries": 1}})
     except Exception:
         pass
 
@@ -1550,13 +1553,18 @@ async def suggest_category(req: SuggestCatReq, user=Depends(get_current_user)):
     listing = "\n".join(f'- [{e["id"]}] {e["path"]}' for e in existing[:150]) or "(nenhuma ainda)"
     desc = (req.description or "")[:600]
     prompt = (
-        "Você organiza uma biblioteca de conteúdos em categorias (árvore). Para o conteúdo "
-        "abaixo, escolha a MELHOR categoria EXISTENTE se houver uma adequada; senão proponha "
-        "UMA nova categoria curta (1–3 palavras) — opcionalmente aninhada sob uma existente.\n"
-        "Responda APENAS um JSON em uma linha, sem texto extra, no formato:\n"
-        '{"matchId": "<id de uma existente ou null>", "newName": "<nome da nova ou null>", '
-        '"newParentId": "<id do pai da nova ou null>", "reason": "<motivo curto>"}\n\n'
-        f"CATEGORIAS EXISTENTES (id › caminho):\n{listing}\n\n"
+        "Você organiza uma biblioteca de conteúdos numa ÁRVORE de categorias (profundidade "
+        "ilimitada). Analise TODA a hierarquia abaixo (cada linha mostra o caminho completo "
+        "Mãe › Filha › Neta…) e decida o lugar MAIS ESPECÍFICO para o conteúdo:\n"
+        "1) Se já existe uma categoria/subcategoria adequada (em QUALQUER nível), use-a (matchId).\n"
+        "2) Senão, proponha UMA nova categoria curta (1–3 palavras) e ANINHE-A no nó existente "
+        "mais específico que se aplica (newParentId) — prefira criar uma sub/sub-sub dentro de "
+        "uma existente a criar uma categoria principal solta, quando fizer sentido.\n"
+        "3) Só crie categoria PRINCIPAL (newParentId null) se realmente for um tema novo de topo.\n"
+        "Responda APENAS um JSON em uma linha, sem texto extra:\n"
+        '{"matchId": "<id existente ou null>", "newName": "<nome da nova ou null>", '
+        '"newParentId": "<id do pai da nova (pode ser um nó profundo) ou null>", "reason": "<curto>"}\n\n'
+        f"ÁRVORE DE CATEGORIAS (id › caminho completo):\n{listing}\n\n"
         f"CONTEÚDO:\nTítulo: {title}\nURL: {(req.url or '')[:200]}\n"
         + (f"Descrição: {desc}\n" if desc else "")
     )
@@ -1616,14 +1624,21 @@ async def ai_gemini_proxy(req: GeminiReq, user=Depends(get_current_user)):
 
 @app.post("/api/ai/backfill")
 async def ai_backfill(background: BackgroundTasks, user=Depends(get_current_user)):
-    """Enriquece (em background) os links ainda sem IA do usuário."""
+    """Garante que TODO conteúdo (novo e antigo) tenha IA: enriquece em lotes os links
+    sem aiEnrichedAt OU sem topicEmbedding (busca semântica/recomendações dependem do
+    vetor), desistindo após 3 tentativas. Devolve `remaining` p/ o front repetir até 0."""
     if not _ai_enabled():
-        return {"ok": False, "reason": "no_key"}
+        return {"ok": False, "reason": "no_key", "remaining": 0}
     uid = str(user["_id"])
-    pending = await db.links.find({"userId": uid, "aiEnrichedAt": {"$exists": False}}).to_list(150)
+    q = {"userId": uid, "$and": [
+        {"$or": [{"aiEnrichedAt": {"$exists": False}}, {"topicEmbedding": {"$exists": False}}]},
+        {"$or": [{"aiTries": {"$exists": False}}, {"aiTries": {"$lt": 3}}]},
+    ]}
+    remaining = await db.links.count_documents(q)
+    pending = await db.links.find(q).limit(60).to_list(60)   # lote por chamada
     for l in pending:
         background.add_task(_enrich_link, str(l["_id"]), uid, l.get("title", ""), l.get("tags", []))
-    return {"ok": True, "queued": len(pending)}
+    return {"ok": True, "queued": len(pending), "remaining": remaining}
 
 # ─── METADATA FETCH ──────────────────────────────────────────────────────────
 def _yt_video_id(url: str) -> str:
