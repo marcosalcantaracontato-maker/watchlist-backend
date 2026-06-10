@@ -336,6 +336,12 @@ class SuggestTagsReq(BaseModel):
     url: str = ""
     description: str = ""
 
+class TeachReq(BaseModel):
+    advice: str = ""
+
+class RulesReq(BaseModel):
+    rules: list = []
+
 class LinkCreate(BaseModel):
     url:        str
     title:      str
@@ -1561,6 +1567,51 @@ def _cosine(a, b) -> float:
     na = math.sqrt(sum(x * x for x in a)); nb = math.sqrt(sum(x * x for x in b))
     return s / (na * nb) if na and nb else 0.0
 
+# "Guia de organização": regras que o usuário ENSINOU à IA. Persistem e são injetadas
+# nos prompts de categoria/tags (a IA não treina; isto é a "memória" prática).
+async def _get_org_rules(uid: str) -> list:
+    doc = await db.ai_prefs.find_one({"userId": uid})
+    return (doc.get("rules") or []) if doc else []
+
+def _rules_block(rules: list) -> str:
+    if not rules:
+        return ""
+    return ("REGRAS DO USUÁRIO (conselhos dele sobre como organizar — siga quando fizer sentido):\n"
+            + "\n".join(f"- {r}" for r in rules[:20]) + "\n\n")
+
+@app.get("/api/ai/rules")
+async def get_rules(user=Depends(get_current_user)):
+    return {"rules": await _get_org_rules(str(user["_id"]))}
+
+@app.put("/api/ai/rules")
+async def put_rules(req: RulesReq, user=Depends(get_current_user)):
+    rules = [str(r).strip()[:160] for r in (req.rules or []) if str(r).strip()][:25]
+    await db.ai_prefs.update_one({"userId": str(user["_id"])},
+                                 {"$set": {"rules": rules, "updatedAt": datetime.utcnow()}}, upsert=True)
+    return {"rules": rules}
+
+@app.post("/api/ai/teach")
+async def ai_teach(req: TeachReq, user=Depends(get_current_user)):
+    """Recebe um CONSELHO do usuário, destila numa REGRA curta e guarda no guia dele."""
+    uid = str(user["_id"])
+    advice = (req.advice or "").strip()[:400]
+    if not advice:
+        raise HTTPException(status_code=400, detail="Conselho vazio")
+    rule = advice
+    if _ai_enabled():
+        prompt = ("Transforme o conselho do usuário sobre como organizar a biblioteca dele em UMA "
+                  "regra curta e imperativa (1 linha, em português, sem aspas, sem numerar). Mantenha "
+                  "o sentido exato.\nConselho: " + advice)
+        r = await (_gemini_chat(prompt, 60, models=GEMINI_SMART_MODELS) if GEMINI_KEYS else _ai_text(prompt, 60))
+        if r:
+            rule = r.strip().strip('"').splitlines()[0][:160]
+    rules = await _get_org_rules(uid)
+    if rule and rule.lower() not in [x.lower() for x in rules]:
+        rules = (rules + [rule])[-25:]
+    await db.ai_prefs.update_one({"userId": uid},
+                                 {"$set": {"rules": rules, "updatedAt": datetime.utcnow()}}, upsert=True)
+    return {"rule": rule, "rules": rules}
+
 @app.post("/api/links/search")
 async def semantic_search(req: SearchReq, user=Depends(get_current_user)):
     """Busca SEMÂNTICA: embeda a query e ranqueia os links do usuário por similaridade
@@ -1630,6 +1681,7 @@ async def suggest_category(req: SuggestCatReq, user=Depends(get_current_user)):
         "Responda APENAS um JSON em uma linha:\n"
         '{"matchId": "<id existente ou null>", "newName": "<nome curto da nova ou null>", '
         '"newParentId": "<id do pai (pode ser nó profundo) ou null>", "reason": "<o que é + por quê>"}\n\n'
+        + _rules_block(await _get_org_rules(uid)) +
         f"ÁRVORE (id › caminho completo (nº de itens)):\n{listing}\n\n"
         f"CONTEÚDO:\nTítulo: {title}\nURL: {(req.url or '')[:200]}\n"
         + (f"Descrição: {desc}\n" if desc else "")
@@ -1675,6 +1727,7 @@ async def suggest_tags(req: SuggestTagsReq, user=Depends(get_current_user)):
         "de palavra solta do título; reflita o conteúdo real. PREFIRA reutilizar tags que o usuário JÁ "
         "usa quando couberem; complemente com novas só se necessário. Sem # e sem repetir.\n"
         "Responda APENAS um array JSON de strings. Ex.: [\"marketing\",\"tráfego pago\",\"iniciante\"]\n\n"
+        + _rules_block(await _get_org_rules(uid)) +
         f"TAGS JÁ USADAS PELO USUÁRIO: {', '.join(vlist) if vlist else '(nenhuma ainda)'}\n"
         f"Título: {title}\nURL: {(req.url or '')[:200]}\n"
         + (f"Descrição: {desc}\n" if desc else "")
