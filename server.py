@@ -1695,6 +1695,54 @@ async def suggest_tags(req: SuggestTagsReq, user=Depends(get_current_user)):
         pass
     return {"tags": tags[:6]}
 
+@app.get("/api/ai/library-map")
+async def library_map(user=Depends(get_current_user)):
+    """Mapa do conhecimento: no que o usuário é FORTE (categorias por contagem
+    recursiva), onde há BURACOS (categorias quase vazias), os TEMAS dominantes, e um
+    RESUMO da IA do perfil da biblioteca."""
+    uid = str(user["_id"])
+    cats = await db.categories.find({"userId": uid}).to_list(3000)
+    links = await db.links.find({"userId": uid}, {"categoryId": 1, "aiTopics": 1}).to_list(8000)
+    by_id = {str(c["_id"]): c for c in cats}
+    direct = {}
+    for l in links:
+        cid = l.get("categoryId")
+        if cid:
+            direct[cid] = direct.get(cid, 0) + 1
+    children = {}
+    for cid, c in by_id.items():
+        children.setdefault(c.get("parentId"), []).append(cid)
+    def rec_count(cid, seen=None):
+        seen = seen or set()
+        if cid in seen:
+            return 0
+        seen.add(cid)
+        return direct.get(cid, 0) + sum(rec_count(ch, seen) for ch in children.get(cid, []))
+    roots = [cid for cid, c in by_id.items() if not c.get("parentId")]
+    cat_stats = sorted(((by_id[cid].get("name", ""), rec_count(cid)) for cid in roots), key=lambda x: -x[1])
+    total = len(links)
+    strengths = [{"name": n, "count": c} for n, c in cat_stats if c >= 3][:8]
+    gaps = [{"name": n, "count": c} for n, c in cat_stats if c <= 2][:8]
+    orphan = sum(1 for l in links if not l.get("categoryId") or l.get("categoryId") not in by_id)
+    topic_freq = {}
+    for l in links:
+        for t in (l.get("aiTopics") or []):
+            topic_freq[t] = topic_freq.get(t, 0) + 1
+    top_topics = sorted(topic_freq.items(), key=lambda x: -x[1])[:12]
+    topics = [{"name": t, "count": c} for t, c in top_topics]
+    summary = ""
+    if _ai_enabled() and total >= 3:
+        cats_str = ", ".join(f"{n} ({c})" for n, c in cat_stats[:15])
+        topics_str = ", ".join(f"{t} ({c})" for t, c in top_topics[:10]) or "(sem temas ainda)"
+        prompt = (
+            "Em 2 a 3 frases, descreva o PERFIL desta biblioteca de conteúdos de um usuário: sobre o "
+            "que ela é, no que ele está mais forte e (se houver) o que está pouco explorado. Tom "
+            "direto e pessoal, em português, sem jargão técnico. Não invente além dos dados.\n"
+            f"Total: {total} conteúdos.\nCategorias (nome (itens)): {cats_str}\nTemas: {topics_str}"
+        )
+        summary = await (_gemini_chat(prompt, 240, models=GEMINI_SMART_MODELS) if GEMINI_KEYS else _ai_text(prompt, 240))
+    return {"total": total, "summary": summary, "strengths": strengths, "gaps": gaps, "topics": topics, "orphan": orphan}
+
 @app.post("/api/ai/gemini")
 async def ai_gemini_proxy(req: GeminiReq, user=Depends(get_current_user)):
     """Proxy do Gemini com ROTAÇÃO de chaves — usado pela IA do Financeiro (e
