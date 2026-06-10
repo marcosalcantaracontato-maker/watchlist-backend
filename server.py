@@ -416,6 +416,9 @@ class SuggestTagsReq(BaseModel):
 class TeachReq(BaseModel):
     advice: str = ""
 
+class AskReq(BaseModel):
+    q: str = ""
+
 class RulesReq(BaseModel):
     rules: list = []
 
@@ -2024,6 +2027,50 @@ async def ai_topics(user=Depends(get_current_user)):
     res = {"topics": topics}
     _topics_cache[uid] = (now, len(items), res)
     return res
+
+@app.post("/api/ai/ask")
+async def ai_ask(req: AskReq, user=Depends(get_current_user)):
+    """Pergunte à sua biblioteca (RAG): recupera os conteúdos mais relevantes por
+    embedding e a IA SINTETIZA a resposta USANDO SÓ o acervo, com CITAÇÕES [n]."""
+    uid = str(user["_id"])
+    q = (req.q or "").strip()[:400]
+    if not q:
+        return {"answer": "", "sources": []}
+    if not _ai_enabled():
+        return {"answer": "IA não configurada.", "sources": []}
+    emb = await _ai_embedding(q)
+    if not emb:
+        return {"answer": "Não consegui buscar agora (embeddings indisponíveis).", "sources": []}
+    docs = await db.links.find({"userId": uid}).to_list(8000)
+    sims = []
+    for d in docs:
+        e = d.get("topicEmbedding")
+        if e:
+            sims.append((_cosine(emb, e), d))
+    sims.sort(key=lambda x: -x[0])
+    top = [d for s, d in sims[:8] if s > 0.22]
+    if not top:
+        return {"answer": "Não encontrei nada relacionado a isso no seu acervo.", "sources": []}
+    blocks = []
+    for i, d in enumerate(top, 1):
+        body = (d.get("contentText") or d.get("aiSummary") or "")[:900]
+        if not body:
+            body = ", ".join(d.get("aiTopics") or [])
+        blocks.append(f"[{i}] {d.get('title','')}\n{body}".strip())
+    ctx = "\n\n".join(blocks)[:8000]
+    prompt = (
+        "Você é o 'segundo cérebro' do usuário. Responda à PERGUNTA usando SOMENTE os trechos do "
+        "acervo dele abaixo. Sintetize de forma útil e objetiva, em português. CITE as fontes pelo "
+        "número entre colchetes (ex.: [1], [3]) ao usar a informação. Se a resposta NÃO estiver nos "
+        "trechos, diga claramente que não encontrou isso no acervo — NÃO invente.\n\n"
+        f"PERGUNTA: {q}\n\nTRECHOS DO ACERVO:\n{ctx}"
+    )
+    answer = await _chat(prompt, 700, temperature=0.3)
+    sources = []
+    for d in top:
+        thumb = d.get("rawThumb") or (f"https://img.youtube.com/vi/{d.get('videoId')}/hqdefault.jpg" if d.get("videoId") else "")
+        sources.append({"id": str(d["_id"]), "title": d.get("title", ""), "url": d.get("url", ""), "thumb": thumb})
+    return {"answer": answer or "Não consegui gerar a resposta agora.", "sources": sources}
 
 @app.post("/api/ai/gemini")
 async def ai_gemini_proxy(req: GeminiReq, user=Depends(get_current_user)):
