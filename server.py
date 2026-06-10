@@ -2227,6 +2227,52 @@ async def ai_gemini_proxy(req: GeminiReq, user=Depends(get_current_user)):
             return {"status": r.status_code, "data": data}
     return last
 
+class GroqReq(BaseModel):
+    prompt: str = ""
+    max_tokens: int = 2048
+    temperature: float = 0.4
+    json_mode: bool = True
+
+@app.post("/api/ai/groq")
+async def ai_groq_proxy(req: GroqReq, user=Depends(get_current_user)):
+    """Proxy do Groq (compatível com OpenAI) com rotação de chaves + fallback de modelos.
+    Usado como REDE DE SEGURANÇA quando o Gemini esgota a cota (ex.: Apresentação do
+    Financeiro). Com json_mode liga o response_format JSON do Groq. Devolve {status, text}."""
+    if not GROQ_KEYS:
+        return {"status": 400, "text": "", "error": "sem chaves Groq"}
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    payload = {"max_tokens": max(256, min(req.max_tokens, 8000)), "temperature": req.temperature,
+               "messages": [{"role": "user", "content": req.prompt}]}
+    if req.json_mode:
+        payload["response_format"] = {"type": "json_object"}
+    last = {"status": 502, "text": "", "error": "sem chaves disponíveis"}
+    async with httpx.AsyncClient(timeout=60) as c:
+        for model in GROQ_MODELS:
+            for key in _groq_keys_available(model):
+                try:
+                    r = await c.post("https://api.groq.com/openai/v1/chat/completions",
+                        headers={"Authorization": f"Bearer {key}"}, json={**payload, "model": model})
+                except Exception as e:
+                    last = {"status": 599, "text": "", "error": str(e)[:200]}
+                    continue
+                if r.status_code == 200:
+                    try:
+                        return {"status": 200, "text": (r.json()["choices"][0]["message"]["content"] or "").strip()}
+                    except Exception:
+                        return {"status": 200, "text": ""}
+                if r.status_code == 429:
+                    msg = ""
+                    try: msg = str((r.json().get("error") or {}).get("message", "")).lower()
+                    except Exception: pass
+                    if any(s in msg for s in ("per day", "daily", "rpd", "tpd")):
+                        _groq_exhausted[(key, model)] = today
+                    last = {"status": 429, "text": "", "error": "rate limit"}
+                    continue
+                try: msg = str((r.json().get("error") or {}).get("message", ""))[:200]
+                except Exception: msg = r.text[:200]
+                last = {"status": r.status_code, "text": "", "error": msg}
+    return last
+
 @app.post("/api/ai/backfill")
 async def ai_backfill(background: BackgroundTasks, user=Depends(get_current_user)):
     """Garante que TODO conteúdo (novo e antigo) tenha IA: enriquece em lotes os links
