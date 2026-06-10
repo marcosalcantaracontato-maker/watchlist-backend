@@ -2134,6 +2134,40 @@ async def ai_insights(user=Depends(get_current_user)):
     _insights_cache[uid] = (now.timestamp(), total, result)
     return result
 
+@app.get("/api/ai/related/{link_id}")
+async def ai_related(link_id: str, user=Depends(get_current_user)):
+    """#14 Recomendação contextual: dado um link, devolve os mais SIMILARES do próprio
+    acervo por similaridade de cosseno do topicEmbedding. 'Vendo X → veja também Y, Z'."""
+    uid = str(user["_id"])
+    try:
+        base = await db.links.find_one({"_id": ObjectId(link_id), "userId": uid})
+    except Exception:
+        base = None
+    if not base:
+        raise HTTPException(status_code=404, detail="Link não encontrado")
+    emb = base.get("topicEmbedding")
+    if not emb:
+        return {"results": []}   # ainda não enriquecido — sem vetor, sem similaridade
+    docs = await db.links.find({"userId": uid, "topicEmbedding": {"$exists": True}}).to_list(8000)
+    scored = []
+    for d in docs:
+        if str(d["_id"]) == link_id:
+            continue
+        v = d.get("topicEmbedding")
+        if not v:
+            continue
+        scored.append((_cosine(emb, v), d))
+    scored.sort(key=lambda x: -x[0])
+    results = []
+    for s, d in scored[:6]:
+        if s < 0.45:   # corta relações fracas (evita "relacionado" sem relação)
+            break
+        thumb = d.get("rawThumb") or (f"https://img.youtube.com/vi/{d.get('videoId')}/hqdefault.jpg" if d.get("videoId") else "")
+        results.append({"id": str(d["_id"]), "score": round(s, 3), "title": d.get("title", ""),
+                        "url": d.get("url", ""), "thumb": thumb, "videoId": d.get("videoId", ""),
+                        "platform": d.get("platform", "other"), "watched": bool(d.get("watched"))})
+    return {"results": results}
+
 _topics_cache = {}  # uid -> (ts, n_items, result) — evita reclusterizar/renomear a cada abertura
 
 @app.get("/api/ai/topics")
