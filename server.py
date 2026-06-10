@@ -1560,7 +1560,42 @@ async def ai_bridge(body: BridgeReq, user=Depends(get_current_user)):
         "Sem saudações, sem enrolação. Máximo 4 linhas."
     )
     text = await _ai_text(prompt, 300)
-    return {"suggestion": text}
+    # tema-ponte (linha "Ponte: ...") vira a busca de um VÍDEO concreto p/ preencher.
+    query = ""
+    m = _re.search(r"Ponte:\s*(.+)", text or "")
+    if m:
+        query = m.group(1).strip().rstrip(".").strip()[:90]
+    if not query:
+        query = f"{a} {b}"
+    videos = await _yt_search(query, 1)
+    return {"suggestion": text, "query": query, "video": (videos[0] if videos else None)}
+
+async def _yt_search(query: str, n: int = 1) -> list:
+    """Busca vídeos reais no YouTube (Data API) p/ a 'ponte' das lacunas. Vazio sem chave."""
+    if not YOUTUBE_API_KEY or not (query or "").strip():
+        return []
+    try:
+        async with httpx.AsyncClient(timeout=8) as c:
+            r = await c.get("https://www.googleapis.com/youtube/v3/search", params={
+                "part": "snippet", "q": query, "type": "video", "maxResults": n,
+                "relevanceLanguage": "pt", "key": YOUTUBE_API_KEY})
+            if r.status_code == 200:
+                out = []
+                for it in r.json().get("items", []):
+                    vid = (it.get("id") or {}).get("videoId")
+                    sn = it.get("snippet") or {}
+                    if vid:
+                        out.append({
+                            "videoId": vid,
+                            "title": sn.get("title", ""),
+                            "channel": sn.get("channelTitle", ""),
+                            "thumb": ((sn.get("thumbnails") or {}).get("medium") or {}).get("url", ""),
+                            "url": f"https://www.youtube.com/watch?v={vid}",
+                        })
+                return out
+    except Exception:
+        pass
+    return []
 
 def _cosine(a, b) -> float:
     s = sum(x * y for x, y in zip(a, b))
