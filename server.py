@@ -57,6 +57,13 @@ GEMINI_CHAT_MODELS     = list(dict.fromkeys(
     [GEMINI_CHAT_MODEL] + [m.strip() for m in GEMINI_CHAT_FALLBACKS.split(",") if m.strip()]))
 GEMINI_EMBED_MODEL     = os.getenv("GEMINI_EMBED_MODEL", "gemini-embedding-001")
 GEMINI_EMBED_DIMS      = int(os.getenv("GEMINI_EMBED_DIMS", "768"))
+# Groq (provedor de CHAT — Llama etc., API compatível com OpenAI, free e rápido).
+# NÃO faz embeddings (esses ficam no Gemini). Chaves em GROQ_API_KEYS (vírgula).
+GROQ_API_KEY           = os.getenv("GROQ_API_KEY", "")
+GROQ_KEYS              = [k.strip() for k in (os.getenv("GROQ_API_KEYS", "") or GROQ_API_KEY).split(",") if k.strip()]
+GROQ_MODELS            = list(dict.fromkeys([m.strip() for m in os.getenv(
+    "GROQ_MODELS", "llama-3.3-70b-versatile,llama-3.1-8b-instant").split(",") if m.strip()]))
+_groq_exhausted: dict  = {}   # (chave, modelo) -> 'YYYY-MM-DD' (cota diária esgotada)
 
 # Cota esgotada HOJE rastreada por (chave, modelo) -> 'YYYY-MM-DD'. Como o limite
 # grátis é por MODELO, uma chave esgotada no 2.5-flash-lite ainda serve no 2.0-flash.
@@ -80,7 +87,7 @@ def _is_daily_quota_429(data: dict) -> bool:
     return False
 
 def _ai_enabled() -> bool:
-    return bool(GEMINI_KEYS or OPENAI_API_KEY)
+    return bool(GEMINI_KEYS or GROQ_KEYS or OPENAI_API_KEY)
 
 def _gemini_keys_available(model: str) -> list:
     today = datetime.utcnow().strftime("%Y-%m-%d")
@@ -146,6 +153,71 @@ async def _gemini_chat(prompt: str, max_tokens: int, temperature: float = 0.3, t
 # Modelos para DECISÕES que exigem nuance (categoria/tags sugeridas ao usuário):
 # começa por um modelo mais forte e cai pros menores. Dedup com a lista padrão.
 GEMINI_SMART_MODELS = list(dict.fromkeys(["gemini-2.5-flash", "gemini-2.0-flash"] + GEMINI_CHAT_MODELS))
+
+def _groq_keys_available(model: str) -> list:
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    return [k for k in GROQ_KEYS if _groq_exhausted.get((k, model)) != today]
+
+async def _groq_chat(prompt: str, max_tokens: int, temperature: float = 0.3, timeout: float = 35):
+    """Chat via Groq (API compatível com OpenAI) com rotação de chaves + fallback de
+    modelos. 429 de cota DIÁRIA marca (chave,modelo); 429 por-minuto é transitório."""
+    if not GROQ_KEYS:
+        return ""
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    async with httpx.AsyncClient(timeout=timeout) as c:
+        for model in GROQ_MODELS:
+            for key in _groq_keys_available(model):
+                for _attempt in range(2):
+                    try:
+                        r = await c.post("https://api.groq.com/openai/v1/chat/completions",
+                            headers={"Authorization": f"Bearer {key}"},
+                            json={"model": model, "max_tokens": max_tokens, "temperature": temperature,
+                                  "messages": [{"role": "user", "content": prompt}]})
+                    except Exception:
+                        continue
+                    if r.status_code == 200:
+                        try:
+                            return (r.json()["choices"][0]["message"]["content"] or "").strip()
+                        except Exception:
+                            return ""
+                    if r.status_code == 429:
+                        msg = ""
+                        try: msg = str((r.json().get("error") or {}).get("message", "")).lower()
+                        except Exception: pass
+                        if any(s in msg for s in ("per day", "daily", "rpd", "tpd")):
+                            _groq_exhausted[(key, model)] = today
+                        break   # → próxima chave (não queima em limite/min)
+                    # outro erro: tenta 2ª vez; persistindo, vai p/ a próxima chave
+    return ""
+
+async def _openai_chat(prompt: str, max_tokens: int, temperature: float = 0.3, timeout: float = 35):
+    if not OPENAI_API_KEY:
+        return ""
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as c:
+            r = await c.post("https://api.openai.com/v1/chat/completions",
+                headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+                json={"model": OPENAI_CHAT_MODEL, "max_tokens": max_tokens, "temperature": temperature,
+                      "messages": [{"role": "user", "content": prompt}]})
+            if r.status_code == 200:
+                return (r.json()["choices"][0]["message"]["content"] or "").strip()
+    except Exception:
+        pass
+    return ""
+
+async def _chat(prompt: str, max_tokens: int, temperature: float = 0.3, timeout: float = 35, models=None):
+    """Texto/chat com MÚLTIPLOS provedores em cascata: Gemini → Groq → OpenAI (o que
+    estiver configurado/responder). `models` aplica-se só à etapa Gemini."""
+    if GEMINI_KEYS:
+        t = await _gemini_chat(prompt, max_tokens, temperature, timeout, models)
+        if t: return t
+    if GROQ_KEYS:
+        t = await _groq_chat(prompt, max_tokens, temperature, timeout)
+        if t: return t
+    if OPENAI_API_KEY:
+        t = await _openai_chat(prompt, max_tokens, temperature, timeout)
+        if t: return t
+    return ""
 try:
     import stripe
     if STRIPE_SECRET_KEY:
@@ -1402,22 +1474,10 @@ async def _ai_tags(title: str) -> list:
     if not title or not _ai_enabled():
         return []
     try:
-        if GEMINI_KEYS:
-            txt = await _gemini_chat(f"{_TAG_SYS}\n\nTítulo: {title}", 200, temperature=0.2, timeout=25)
-            if txt:
-                return _extract_tags(txt)
-        else:
-            async with httpx.AsyncClient(timeout=20) as c:
-                r = await c.post("https://api.openai.com/v1/chat/completions",
-                    headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
-                    json={"model": OPENAI_CHAT_MODEL, "temperature": 0.2, "max_tokens": 60,
-                          "messages": [{"role": "system", "content": _TAG_SYS},
-                                       {"role": "user", "content": f"Título: {title}"}]})
-                if r.status_code == 200:
-                    return _extract_tags(r.json()["choices"][0]["message"]["content"])
+        txt = await _chat(f"{_TAG_SYS}\n\nTítulo: {title}", 200, temperature=0.2, timeout=25)
+        return _extract_tags(txt) if txt else []
     except Exception:
-        pass
-    return []
+        return []
 
 async def _ai_embedding(text: str):
     if not text or not _ai_enabled():
@@ -1441,23 +1501,13 @@ async def _ai_embedding(text: str):
     return None
 
 async def _ai_text(prompt: str, max_tokens: int = 600) -> str:
-    """Geração de texto livre (resumos) — Gemini ou OpenAI."""
+    """Geração de texto livre (resumos) — Gemini → Groq → OpenAI."""
     if not _ai_enabled():
         return ""
     try:
-        if GEMINI_KEYS:
-            return await _gemini_chat(prompt, max_tokens, temperature=0.3, timeout=35)
-        else:
-            async with httpx.AsyncClient(timeout=35) as c:
-                r = await c.post("https://api.openai.com/v1/chat/completions",
-                    headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
-                    json={"model": OPENAI_CHAT_MODEL, "max_tokens": max_tokens,
-                          "messages": [{"role": "user", "content": prompt}]})
-                if r.status_code == 200:
-                    return r.json()["choices"][0]["message"]["content"].strip()
+        return await _chat(prompt, max_tokens, temperature=0.3, timeout=35)
     except Exception:
-        pass
-    return ""
+        return ""
 
 async def _yt_description(video_id: str) -> str:
     if not YOUTUBE_API_KEY or not video_id:
@@ -1499,7 +1549,7 @@ async def _enrich_link(link_id: str, user_id: str, title: str, existing_tags: li
 @limiter.limit("10/minute")
 async def ai_status(request: Request):
     """Diagnóstico: confirma se a IA responde (faz 1 chamada mínima de tags+embedding)."""
-    prov = "gemini" if GEMINI_KEYS else ("openai" if OPENAI_API_KEY else "none")
+    prov = "gemini" if GEMINI_KEYS else ("groq" if GROQ_KEYS else ("openai" if OPENAI_API_KEY else "none"))
     if prov == "none":
         return {"provider": "none", "configured": False}
     emb = await _ai_embedding("teste de embedding")
@@ -1517,9 +1567,11 @@ async def ai_status(request: Request):
         "models": GEMINI_CHAT_MODELS,
         "exhausted_today": [k[:6] + "…" for k in dead],
     } if GEMINI_KEYS else None
+    groq_info = {"keys": len(GROQ_KEYS), "models": GROQ_MODELS} if GROQ_KEYS else None
     return {"provider": prov, "configured": True,
             "keys": keys_info,
-            "chat_model": (GEMINI_CHAT_MODELS[0] if GEMINI_KEYS else OPENAI_CHAT_MODEL),
+            "groq": groq_info,
+            "chat_model": (GEMINI_CHAT_MODELS[0] if GEMINI_KEYS else (GROQ_MODELS[0] if GROQ_KEYS else OPENAI_CHAT_MODEL)),
             "embed_model": (GEMINI_EMBED_MODEL if GEMINI_KEYS else OPENAI_EMBED_MODEL),
             "tags_ok": bool(tags), "tags_sample": tags, "probe": probe}
 
@@ -1641,7 +1693,7 @@ async def ai_teach(req: TeachReq, user=Depends(get_current_user)):
         prompt = ("Transforme o conselho do usuário sobre como organizar a biblioteca dele em UMA "
                   "regra curta e imperativa (1 linha, em português, sem aspas, sem numerar). Mantenha "
                   "o sentido exato.\nConselho: " + advice)
-        r = await (_gemini_chat(prompt, 60, models=GEMINI_SMART_MODELS) if GEMINI_KEYS else _ai_text(prompt, 60))
+        r = await _chat(prompt, 60, models=GEMINI_SMART_MODELS)
         if r:
             rule = r.strip().strip('"').splitlines()[0][:160]
     rules = await _get_org_rules(uid)
@@ -1730,8 +1782,7 @@ async def suggest_category(req: SuggestCatReq, user=Depends(get_current_user)):
         f"CONTEÚDO:\nTítulo: {title}\nURL: {(req.url or '')[:200]}\n"
         + (f"Descrição: {desc}\n" if desc else "")
     )
-    txt = await (_gemini_chat(prompt, 260, temperature=0.2, models=GEMINI_SMART_MODELS) if GEMINI_KEYS
-                 else _ai_text(prompt, 260))
+    txt = await _chat(prompt, 260, temperature=0.2, models=GEMINI_SMART_MODELS)
     out = {"matchId": None, "newName": None, "newParentId": None, "reason": ""}
     try:
         m = _re.search(r"\{.*\}", txt, _re.S)
@@ -1776,8 +1827,7 @@ async def suggest_tags(req: SuggestTagsReq, user=Depends(get_current_user)):
         f"Título: {title}\nURL: {(req.url or '')[:200]}\n"
         + (f"Descrição: {desc}\n" if desc else "")
     )
-    txt = await (_gemini_chat(prompt, 140, temperature=0.3, models=GEMINI_SMART_MODELS) if GEMINI_KEYS
-                 else _ai_text(prompt, 140))
+    txt = await _chat(prompt, 140, temperature=0.3, models=GEMINI_SMART_MODELS)
     tags = []
     try:
         m = _re.search(r"\[.*\]", txt, _re.S)
@@ -1837,7 +1887,7 @@ async def library_map(user=Depends(get_current_user)):
             "direto e pessoal, em português, sem jargão técnico. Não invente além dos dados.\n"
             f"Total: {total} conteúdos.\nCategorias (nome (itens)): {cats_str}\nTemas: {topics_str}"
         )
-        summary = await (_gemini_chat(prompt, 240, models=GEMINI_SMART_MODELS) if GEMINI_KEYS else _ai_text(prompt, 240))
+        summary = await _chat(prompt, 240, models=GEMINI_SMART_MODELS)
     return {"total": total, "summary": summary, "strengths": strengths, "gaps": gaps, "topics": topics, "orphan": orphan}
 
 _topics_cache = {}  # uid -> (ts, n_items, result) — evita reclusterizar/renomear a cada abertura
@@ -1887,7 +1937,7 @@ async def ai_topics(user=Depends(get_current_user)):
         prompt = ("Dê um NOME curto (1 a 3 palavras, em português) para cada GRUPO de conteúdos "
                   "abaixo, refletindo o tema em comum. Responda APENAS um array JSON de strings, na "
                   "MESMA ORDEM e quantidade dos grupos.\n" + "\n".join(lines))
-        txt = await (_gemini_chat(prompt, 220, models=GEMINI_SMART_MODELS) if GEMINI_KEYS else _ai_text(prompt, 220))
+        txt = await _chat(prompt, 220, models=GEMINI_SMART_MODELS)
         try:
             m = _re.search(r"\[.*\]", txt, _re.S)
             if m:
