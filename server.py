@@ -1150,6 +1150,7 @@ async def delete_link(link_id: str, user=Depends(get_current_user)):
     )
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Link não encontrado")
+    await db.chunks.delete_many({"linkId": link_id, "userId": str(user["_id"])})
     return {"ok": True}
 
 # ─── NOTE FOLDERS ─────────────────────────────────────────────────────────────
@@ -1546,25 +1547,96 @@ def _html_to_text(html: str) -> str:
     chunk = re.sub(r"\n\s*\n+", "\n\n", chunk)
     return chunk.strip()
 
-async def _yt_transcript(video_id: str) -> str:
-    """Best-effort: transcrição do vídeo via timedtext (sem OAuth). Vazio se não houver."""
+def _parse_timedtext(xml: str) -> list:
+    """Parse PURO do XML do timedtext → [{"t": segundos, "text": ...}]. Preserva os
+    TIMESTAMPS (antes jogados fora) — são eles que permitem citar o minuto do vídeo."""
+    import html as _h
+    segs = []
+    for m in _re.finditer(r'<text\s+[^>]*start="([\d.]+)"[^>]*>(.*?)</text>', xml or "", _re.S):
+        txt = _re.sub(r"\s+", " ", _h.unescape(_re.sub(r"<[^>]+>", " ", m.group(2)))).strip()
+        if txt:
+            segs.append({"t": float(m.group(1)), "text": txt})
+    return segs
+
+async def _yt_transcript_segments(video_id: str) -> list:
+    """Best-effort: transcrição COM timestamps via timedtext (sem OAuth). [] se não houver."""
     if not video_id:
-        return ""
+        return []
     try:
         async with httpx.AsyncClient(timeout=12, follow_redirects=True) as c:
             r = await c.get(f"https://www.youtube.com/watch?v={video_id}",
                             headers={"User-Agent": "Mozilla/5.0", "Accept-Language": "pt-BR,pt,en"})
             urls = _re.findall(r'"baseUrl":"(https://www\.youtube\.com/api/timedtext[^"]+)"', r.text)
             if not urls:
-                return ""
+                return []
             base = urls[0].replace("\\u0026", "&").replace("\\/", "/")
             tr = await c.get(base)
-            import html as _h
-            parts = _re.findall(r"<text[^>]*>(.*?)</text>", tr.text, _re.S)
-            out = " ".join(_h.unescape(_re.sub(r"<[^>]+>", " ", p)) for p in parts)
-            return _re.sub(r"\s+", " ", out).strip()
+            return _parse_timedtext(tr.text)
     except Exception:
-        return ""
+        return []
+
+async def _yt_transcript(video_id: str) -> str:
+    """Transcrição como texto único (compat — resumo/embedding do link inteiro)."""
+    segs = await _yt_transcript_segments(video_id)
+    return " ".join(s["text"] for s in segs).strip()
+
+def _chunk_segments(segments: list, target_chars: int = 700, cap: int = 24) -> list:
+    """Agrupa segmentos timestampados em CHUNKS ~target_chars, carregando o tempo de
+    início do 1º segmento → [{"t": seg|None, "text": ...}]. Cap protege a cota."""
+    chunks, buf, t0 = [], [], None
+    size = 0
+    for s in segments:
+        if t0 is None:
+            t0 = s["t"]
+        buf.append(s["text"]); size += len(s["text"]) + 1
+        if size >= target_chars:
+            chunks.append({"t": int(t0), "text": " ".join(buf)})
+            buf, t0, size = [], None, 0
+            if len(chunks) >= cap:
+                return chunks
+    if buf and len(chunks) < cap:
+        chunks.append({"t": int(t0), "text": " ".join(buf)})
+    return chunks
+
+def _chunk_text(text: str, target_chars: int = 800, cap: int = 24) -> list:
+    """Divide texto corrido (artigo/post) em chunks por sentença → [{"t": None, ...}]."""
+    text = (text or "").strip()
+    if not text:
+        return []
+    sentences = _re.split(r"(?<=[.!?…])\s+|\n{2,}", text)
+    chunks, buf, size = [], [], 0
+    for s in sentences:
+        s = s.strip()
+        if not s:
+            continue
+        buf.append(s); size += len(s) + 1
+        if size >= target_chars:
+            chunks.append({"t": None, "text": " ".join(buf)})
+            buf, size = [], 0
+            if len(chunks) >= cap:
+                return chunks
+    if buf and len(chunks) < cap:
+        chunks.append({"t": None, "text": " ".join(buf)})
+    return chunks
+
+async def _ai_embeddings_batch(texts: list) -> list:
+    """Embeddings em LOTE (1 chamada p/ até 100 textos via batchEmbedContents) —
+    essencial p/ chunks sem estourar a cota. Devolve lista alinhada (None onde falhou)."""
+    if not texts:
+        return []
+    if GEMINI_KEYS:
+        out = []
+        for i in range(0, len(texts), 100):
+            lote = texts[i:i + 100]
+            j = await _gemini_post(f"models/{GEMINI_EMBED_MODEL}:batchEmbedContents",
+                {"requests": [{"model": f"models/{GEMINI_EMBED_MODEL}",
+                               "content": {"parts": [{"text": t[:4000]}]},
+                               "outputDimensionality": GEMINI_EMBED_DIMS} for t in lote]},
+                GEMINI_EMBED_MODEL, timeout=60)
+            embs = (j or {}).get("embeddings") or []
+            out.extend([(e or {}).get("values") for e in embs] + [None] * (len(lote) - len(embs)))
+        return out
+    return [await _ai_embedding(t) for t in texts]   # fallback sequencial (OpenAI)
 
 async def _extract_content(url: str, platform: str, video_id: str):
     """Texto REAL do conteúdo (o multiplicador): YouTube→transcrição (senão descrição);
@@ -1637,6 +1709,32 @@ async def _enrich_link(link_id: str, user_id: str):
             summary = await _summarize(title, base)
             if summary:
                 updates["aiSummary"] = summary
+
+    # CHUNKS com timestamp (1x por link): vídeo → segmentos do timedtext (carregam o
+    # MINUTO de cada trecho → o RAG cita "aos 12:30" e o clique abre o vídeo ali);
+    # artigo/post → chunks por sentença. Vetor por chunk via batchEmbedContents.
+    if not doc.get("chunksAt"):
+        vid = doc.get("videoId", "")
+        chunks = []
+        if vid:
+            segs = await _yt_transcript_segments(vid)
+            chunks = _chunk_segments(segs) if segs else _chunk_text(content or "")
+        else:
+            chunks = _chunk_text(content or "")
+        if chunks:
+            vecs = await _ai_embeddings_batch([c["text"] for c in chunks])
+            rows = [{"userId": user_id, "linkId": link_id, "idx": i,
+                     "t": c["t"], "text": c["text"], "embedding": v}
+                    for i, (c, v) in enumerate(zip(chunks, vecs)) if v]
+            if rows:
+                try:
+                    await db.chunks.delete_many({"linkId": link_id, "userId": user_id})
+                    await db.chunks.insert_many(rows)
+                    updates["chunksAt"] = datetime.utcnow()
+                except Exception:
+                    pass
+        else:
+            updates["chunksAt"] = datetime.utcnow()   # sem texto → não fica re-tentando
     try:
         await db.links.update_one({"_id": doc["_id"], "userId": user_id},
                                   {"$set": updates, "$inc": {"aiTries": 1}})
@@ -2274,8 +2372,56 @@ async def ai_ask(req: AskReq, user=Depends(get_current_user)):
     emb = await _ai_embedding(q)
     if not emb:
         return {"answer": "Não consegui buscar agora (embeddings indisponíveis).", "sources": []}
-    # Fase 1 (leve): ranqueia trazendo SÓ os vetores. Fase 2: contentText/aiSummary
-    # apenas dos top-8 — evita puxar o acervo inteiro (texto+vetor) a cada pergunta.
+    # ── Caminho 1 (preferido): CHUNKS com timestamp — recupera TRECHOS, não links
+    # inteiros, e cita o MINUTO do vídeo (fonte ganha "t" → o front abre em ?t=).
+    cvecs = await db.chunks.find({"userId": uid}, {"embedding": 1, "linkId": 1}).to_list(20000)
+    picked = []
+    if cvecs:
+        csims = [(_cosine(emb, c.get("embedding")), c) for c in cvecs]
+        csims.sort(key=lambda x: -x[0])
+        per_link = {}
+        for s, c in csims:
+            if s < 0.25 or len(picked) >= 10:
+                break
+            lid = c["linkId"]
+            if per_link.get(lid, 0) >= 3:   # diversidade: máx 3 trechos do mesmo link
+                continue
+            per_link[lid] = per_link.get(lid, 0) + 1
+            picked.append((s, c))
+    if picked:
+        chunk_ids = [c["_id"] for _, c in picked]
+        full = {c["_id"]: c for c in await db.chunks.find(
+            {"_id": {"$in": chunk_ids}}, {"text": 1, "t": 1, "linkId": 1}).to_list(len(chunk_ids))}
+        link_ids = list(dict.fromkeys(c["linkId"] for _, c in picked))
+        ldocs = {str(d["_id"]): d for d in await db.links.find(
+            {"_id": {"$in": [ObjectId(l) for l in link_ids]}, "userId": uid},
+            {"title": 1, "url": 1, "rawThumb": 1, "videoId": 1}).to_list(len(link_ids))}
+        blocks, sources = [], []
+        for i, (s, c) in enumerate(picked, 1):
+            ch = full.get(c["_id"]) or {}
+            ld = ldocs.get(c["linkId"]) or {}
+            t = ch.get("t")
+            stamp = f" (aos {int(t)//60}:{int(t)%60:02d})" if isinstance(t, (int, float)) else ""
+            blocks.append(f"[{i}] {ld.get('title','')}{stamp}\n{(ch.get('text') or '')[:900]}".strip())
+            thumb = ld.get("rawThumb") or (f"https://img.youtube.com/vi/{ld.get('videoId')}/hqdefault.jpg" if ld.get("videoId") else "")
+            sources.append({"id": c["linkId"], "title": ld.get("title", ""), "url": ld.get("url", ""),
+                            "thumb": thumb, "videoId": ld.get("videoId", ""),
+                            "t": int(t) if isinstance(t, (int, float)) else None})
+        ctx = "\n\n".join(blocks)[:9000]
+        prompt = (
+            "Você é o 'segundo cérebro' do usuário. Responda à PERGUNTA usando SOMENTE os trechos do "
+            "acervo dele abaixo. Sintetize de forma útil e objetiva, em português. CITE as fontes pelo "
+            "número entre colchetes (ex.: [1], [3]) ao usar a informação; quando o trecho tiver um "
+            "tempo (ex.: 'aos 12:30'), mencione-o — o usuário pode abrir o vídeo naquele ponto. Se a "
+            "resposta NÃO estiver nos trechos, diga claramente que não encontrou isso no acervo — NÃO "
+            "invente.\n\n"
+            f"PERGUNTA: {q}\n\nTRECHOS DO ACERVO:\n{ctx}"
+        )
+        answer = await _chat(prompt, 700, temperature=0.3)
+        return {"answer": answer or "Não consegui gerar a resposta agora.", "sources": sources}
+
+    # ── Caminho 2 (fallback): nível de LINK — biblioteca ainda sem chunks (backfill
+    # pendente) ou nenhum trecho relevante. 2 fases: vetores → texto só dos top-8.
     docs = await db.links.find({"userId": uid, "topicEmbedding": {"$exists": True}},
                                {"topicEmbedding": 1}).to_list(8000)
     sims = [(_cosine(emb, d["topicEmbedding"]), d["_id"]) for d in docs if d.get("topicEmbedding")]
@@ -2306,7 +2452,8 @@ async def ai_ask(req: AskReq, user=Depends(get_current_user)):
     sources = []
     for d in top:
         thumb = d.get("rawThumb") or (f"https://img.youtube.com/vi/{d.get('videoId')}/hqdefault.jpg" if d.get("videoId") else "")
-        sources.append({"id": str(d["_id"]), "title": d.get("title", ""), "url": d.get("url", ""), "thumb": thumb})
+        sources.append({"id": str(d["_id"]), "title": d.get("title", ""), "url": d.get("url", ""),
+                        "thumb": thumb, "videoId": d.get("videoId", ""), "t": None})
     return {"answer": answer or "Não consegui gerar a resposta agora.", "sources": sources}
 
 @app.post("/api/ai/gemini")
@@ -2399,7 +2546,7 @@ async def ai_backfill(background: BackgroundTasks, user=Depends(get_current_user
         return {"ok": False, "reason": "no_key", "remaining": 0}
     uid = str(user["_id"])
     q = {"userId": uid, "$and": [
-        {"$or": [{"aiEnrichedAt": {"$exists": False}}, {"topicEmbedding": {"$exists": False}}, {"contentText": {"$exists": False}}, {"aiSummary": {"$exists": False}}]},
+        {"$or": [{"aiEnrichedAt": {"$exists": False}}, {"topicEmbedding": {"$exists": False}}, {"contentText": {"$exists": False}}, {"aiSummary": {"$exists": False}}, {"chunksAt": {"$exists": False}}]},
         {"$or": [{"aiTries": {"$exists": False}}, {"aiTries": {"$lt": 3}}]},
     ]}
     remaining = await db.links.count_documents(q)
@@ -2959,6 +3106,8 @@ async def startup():
     await db.note_folders.create_index([("userId", 1), ("order", 1)])
     # Backups
     await db.backups.create_index([("userId", 1), ("type", 1), ("createdAt", -1)])
+    # Chunks (RAG com timestamp)
+    await db.chunks.create_index([("userId", 1), ("linkId", 1)])
 
     # Migração: backfill 'position' em notas antigas (a partir do updatedAt em ms)
     try:

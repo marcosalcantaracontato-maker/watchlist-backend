@@ -157,3 +157,41 @@ def test_create_jwt_roundtrip():
     claims = jose_jwt.decode(token, server.JWT_SECRET, algorithms=[server.ALGORITHM])
     assert claims["sub"] == "user-123"
     assert claims["exp"] > datetime.utcnow().timestamp()
+
+
+# ── chunks com timestamp (citação por minuto) ─────────────────────────────────
+def test_parse_timedtext_extracts_time_and_text():
+    xml = ('<transcript><text start="1.5" dur="3">Ol&amp;aacute; <b>mundo</b></text>'
+           '<text start="12.3" dur="2">segundo trecho</text>'
+           '<text start="20" dur="2">   </text></transcript>')
+    segs = server._parse_timedtext(xml)
+    assert len(segs) == 2                       # o vazio é descartado
+    assert segs[0]["t"] == 1.5 and "mundo" in segs[0]["text"]
+    assert segs[1] == {"t": 12.3, "text": "segundo trecho"}
+
+def test_parse_timedtext_garbage_is_empty():
+    assert server._parse_timedtext("") == []
+    assert server._parse_timedtext("<html>not captions</html>") == []
+
+def test_chunk_segments_groups_and_keeps_first_timestamp():
+    segs = [{"t": float(i * 10), "text": "palavra " * 20} for i in range(10)]   # ~160 chars cada
+    chunks = server._chunk_segments(segs, target_chars=300)
+    assert len(chunks) >= 2
+    assert chunks[0]["t"] == 0                  # tempo do 1º segmento do grupo
+    assert chunks[1]["t"] > 0
+    assert all(isinstance(c["t"], int) for c in chunks)
+
+def test_chunk_segments_respects_cap():
+    segs = [{"t": float(i), "text": "x" * 200} for i in range(100)]
+    assert len(server._chunk_segments(segs, target_chars=100, cap=5)) == 5
+
+def test_chunk_text_splits_on_sentences():
+    text = ("Primeira frase completa. " * 30).strip()
+    chunks = server._chunk_text(text, target_chars=200)
+    assert len(chunks) >= 2
+    assert all(c["t"] is None for c in chunks)
+    assert all(c["text"] for c in chunks)
+
+def test_chunk_text_empty_is_empty():
+    assert server._chunk_text("") == []
+    assert server._chunk_text("   ") == []
