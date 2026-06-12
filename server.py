@@ -1368,9 +1368,12 @@ HOME_COLLECTIONS = [
 @app.get("/api/home")
 async def home_layout(user=Depends(get_current_user)):
     uid = str(user["_id"])
-    cats = await db.categories.find({"userId": uid}).to_list(2000)
+    cats = await db.categories.find({"userId": uid}, {"_id": 1}).to_list(2000)
     cat_ids = {str(c["_id"]) for c in cats}
-    links = await db.links.find({"userId": uid}).to_list(5000)
+    # Projeção: as seções da home só usam status/recência/vetor — sem contentText.
+    links = await db.links.find({"userId": uid},
+        {"categoryId": 1, "topicEmbedding": 1, "title": 1, "watched": 1, "watchedAt": 1,
+         "watchedSeconds": 1, "durationSeconds": 1, "lastWatchedAt": 1, "createdAt": 1}).to_list(5000)
     valid = [l for l in links if l.get("categoryId") in cat_ids]
 
     sections = []
@@ -1802,7 +1805,11 @@ async def semantic_search(req: SearchReq, user=Depends(get_current_user)):
     if not q:
         return {"semantic": False, "results": []}
     uid = str(user["_id"])
-    docs = await db.links.find({"userId": uid}).to_list(8000)
+    # Projeção: só o que a busca usa. SEM contentText (8KB/doc) — com biblioteca
+    # grande, puxar o doc inteiro custava dezenas de MB por busca digitada.
+    docs = await db.links.find({"userId": uid},
+        {"title": 1, "url": 1, "rawThumb": 1, "videoId": 1, "platform": 1,
+         "tags": 1, "aiTopics": 1, "topicEmbedding": 1}).to_list(8000)
     by_id = {str(d["_id"]): d for d in docs}
     def _fmt(did, score):
         d = by_id[did]
@@ -2159,7 +2166,7 @@ async def ai_related(link_id: str, user=Depends(get_current_user)):
     acervo por similaridade de cosseno do topicEmbedding. 'Vendo X → veja também Y, Z'."""
     uid = str(user["_id"])
     try:
-        base = await db.links.find_one({"_id": ObjectId(link_id), "userId": uid})
+        base = await db.links.find_one({"_id": ObjectId(link_id), "userId": uid}, {"topicEmbedding": 1})
     except Exception:
         base = None
     if not base:
@@ -2167,7 +2174,9 @@ async def ai_related(link_id: str, user=Depends(get_current_user)):
     emb = base.get("topicEmbedding")
     if not emb:
         return {"results": []}   # ainda não enriquecido — sem vetor, sem similaridade
-    docs = await db.links.find({"userId": uid, "topicEmbedding": {"$exists": True}}).to_list(8000)
+    docs = await db.links.find({"userId": uid, "topicEmbedding": {"$exists": True}},
+        {"topicEmbedding": 1, "title": 1, "url": 1, "rawThumb": 1,
+         "videoId": 1, "platform": 1, "watched": 1}).to_list(8000)
     scored = []
     for d in docs:
         if str(d["_id"]) == link_id:
@@ -2263,16 +2272,20 @@ async def ai_ask(req: AskReq, user=Depends(get_current_user)):
     emb = await _ai_embedding(q)
     if not emb:
         return {"answer": "Não consegui buscar agora (embeddings indisponíveis).", "sources": []}
-    docs = await db.links.find({"userId": uid}).to_list(8000)
-    sims = []
-    for d in docs:
-        e = d.get("topicEmbedding")
-        if e:
-            sims.append((_cosine(emb, e), d))
+    # Fase 1 (leve): ranqueia trazendo SÓ os vetores. Fase 2: contentText/aiSummary
+    # apenas dos top-8 — evita puxar o acervo inteiro (texto+vetor) a cada pergunta.
+    docs = await db.links.find({"userId": uid, "topicEmbedding": {"$exists": True}},
+                               {"topicEmbedding": 1}).to_list(8000)
+    sims = [(_cosine(emb, d["topicEmbedding"]), d["_id"]) for d in docs if d.get("topicEmbedding")]
     sims.sort(key=lambda x: -x[0])
-    top = [d for s, d in sims[:8] if s > 0.22]
-    if not top:
+    top_ids = [did for s, did in sims[:8] if s > 0.22]
+    if not top_ids:
         return {"answer": "Não encontrei nada relacionado a isso no seu acervo.", "sources": []}
+    top_docs = await db.links.find({"_id": {"$in": top_ids}, "userId": uid},
+        {"title": 1, "url": 1, "rawThumb": 1, "videoId": 1,
+         "contentText": 1, "aiSummary": 1, "aiTopics": 1}).to_list(len(top_ids))
+    pos = {did: i for i, did in enumerate(top_ids)}
+    top = sorted(top_docs, key=lambda d: pos.get(d["_id"], 99))   # preserva o ranking
     blocks = []
     for i, d in enumerate(top, 1):
         body = (d.get("contentText") or d.get("aiSummary") or "")[:900]
