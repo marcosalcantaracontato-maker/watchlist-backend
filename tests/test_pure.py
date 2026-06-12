@@ -195,3 +195,33 @@ def test_chunk_text_splits_on_sentences():
 def test_chunk_text_empty_is_empty():
     assert server._chunk_text("") == []
     assert server._chunk_text("   ") == []
+
+
+# ── importação em massa (parsers) ─────────────────────────────────────────────
+def test_parse_bookmarks_html():
+    html = '''<DL><p>
+      <DT><A HREF="https://example.com/a" ADD_DATE="123">Artigo &amp; Cia</A>
+      <DT><A HREF="https://example.com/a">duplicado</A>
+      <DT><A HREF="javascript:alert(1)">ruim</A>
+      <DT><A HREF="https://youtu.be/dQw4w9WgXcQ">Vídeo</A>
+    </p></DL>'''
+    out = server._parse_bookmarks_html(html)
+    assert [b["url"] for b in out] == ["https://example.com/a", "https://youtu.be/dQw4w9WgXcQ"]
+    assert out[0]["title"] == "Artigo & Cia"
+
+def test_parse_bookmarks_empty():
+    assert server._parse_bookmarks_html("") == []
+    assert server._parse_bookmarks_html("<html>sem links</html>") == []
+
+def test_parse_playlist_page():
+    html = ('{"videoId":"dQw4w9WgXcQ","thumbnail":{},"title":{"runs":[{"text":"Primeiro v\u00eddeo"}]}}'
+            '{"videoId":"dQw4w9WgXcQ","title":{"runs":[{"text":"dup"}]}}'
+            '{"videoId":"abcdefghijk","x":1,"title":{"runs":[{"text":"Segundo"}]}}')
+    out = server._parse_playlist_page(html)
+    assert len(out) == 2
+    assert out[0] == {"videoId": "dQw4w9WgXcQ", "title": "Primeiro vídeo"}
+    assert out[1]["videoId"] == "abcdefghijk"
+
+def test_parse_playlist_garbage():
+    assert server._parse_playlist_page("") == []
+    assert server._parse_playlist_page("<html>not a playlist</html>") == []

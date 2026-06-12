@@ -3105,6 +3105,98 @@ async def export_data(user=Depends(get_current_user)):
         "links":      links
     }
 
+# ─── IMPORTAÇÃO EM MASSA (onboarding: biblioteca instantânea) ─────────────────
+def _parse_bookmarks_html(html: str) -> list:
+    """Bookmarks Netscape (export do Chrome/Edge/Firefox) → [{url, title}]. Puro."""
+    import html as _h
+    out, seen = [], set()
+    for m in _re.finditer(r'<A[^>]+HREF="([^"]+)"[^>]*>(.*?)</A>', html or "", _re.S | _re.I):
+        url = m.group(1).strip()
+        if not url.lower().startswith(("http://", "https://")) or url in seen:
+            continue
+        seen.add(url)
+        title = _re.sub(r"\s+", " ", _h.unescape(_re.sub(r"<[^>]+>", " ", m.group(2)))).strip()
+        out.append({"url": url, "title": title or url})
+    return out
+
+def _parse_playlist_page(html: str) -> list:
+    """HTML da página de playlist do YouTube → [{videoId, title}] (ordem, dedup). Puro."""
+    out, seen = [], set()
+    for m in _re.finditer(r'"videoId":"([A-Za-z0-9_-]{11})".{0,2000}?"title":\{"runs":\[\{"text":"((?:[^"\\]|\\.)*)"', html or ""):
+        vid = m.group(1)
+        if vid in seen:
+            continue
+        seen.add(vid)
+        try:
+            title = _json.loads(f'"{m.group(2)}"')
+        except Exception:
+            title = m.group(2)
+        out.append({"videoId": vid, "title": title})
+    return out
+
+class BulkImportReq(BaseModel):
+    kind: str = "bookmarks"           # bookmarks | playlist
+    url: str = ""                     # playlist do YouTube (?list=)
+    html: str = ""                    # conteúdo do arquivo de bookmarks
+    categoryId: Optional[str] = None
+
+@app.post("/api/import/bulk")
+@limiter.limit("10/hour")
+async def import_bulk(request: Request, req: BulkImportReq, user=Depends(get_current_user)):
+    """Importa MUITOS links de uma vez (playlist do YouTube ou bookmarks do navegador).
+    Dedup contra o acervo, respeita o limite do plano free. O enriquecimento de IA
+    acontece pelo backfill normal (lotes em background) — nada trava aqui."""
+    uid = str(user["_id"])
+    if req.kind == "playlist":
+        m = _re.search(r"[?&]list=([A-Za-z0-9_-]+)", req.url or "")
+        if not m:
+            raise HTTPException(status_code=400, detail="URL de playlist inválida (precisa conter ?list=)")
+        try:
+            async with httpx.AsyncClient(timeout=15, follow_redirects=True) as c:
+                r = await c.get(f"https://www.youtube.com/playlist?list={m.group(1)}",
+                                headers={"User-Agent": "Mozilla/5.0", "Accept-Language": "pt-BR,pt,en"})
+            vids = _parse_playlist_page(r.text)[:200]
+        except Exception:
+            raise HTTPException(status_code=502, detail="Não consegui ler a playlist agora")
+        items = [{"url": f"https://www.youtube.com/watch?v={v['videoId']}", "title": v["title"],
+                  "videoId": v["videoId"]} for v in vids]
+    else:
+        items = [{"url": b["url"], "title": b["title"], "videoId": _yt_video_id(b["url"])}
+                 for b in _parse_bookmarks_html(req.html or "")[:500]]
+    if not items:
+        return {"ok": True, "found": 0, "imported": 0, "skipped": 0}
+
+    existing = await db.links.find({"userId": uid}, {"videoId": 1, "url": 1}).to_list(8000)
+    have_v = {d.get("videoId") for d in existing if d.get("videoId")}
+    have_u = {d.get("url") for d in existing}
+    limit = 300 if user.get("plan", "free") == "free" else None
+    cat = req.categoryId if req.categoryId else None
+    now = datetime.utcnow()
+    docs, skipped = [], 0
+    for it in items:
+        if (it["videoId"] and it["videoId"] in have_v) or it["url"] in have_u:
+            skipped += 1
+            continue
+        if limit is not None and len(existing) + len(docs) >= limit:
+            break
+        docs.append({
+            "userId": uid, "url": it["url"], "title": (it["title"] or it["url"])[:300],
+            "thumbnail": "", "rawThumb": "",
+            "platform": "youtube" if it["videoId"] else "other",
+            "videoId": it["videoId"] or "", "categoryId": cat,
+            "watched": False, "notes": "", "tags": [], "order": 0,
+            "createdAt": now, "watchedAt": None,
+            "durationSeconds": None, "watchedSeconds": 0,
+            "lastWatchedAt": None, "watchCount": 0, "isFavorite": False,
+        })
+        if it["videoId"]:
+            have_v.add(it["videoId"])
+        have_u.add(it["url"])
+    if docs:
+        await db.links.insert_many(docs)
+    return {"ok": True, "found": len(items), "imported": len(docs), "skipped": skipped,
+            "limited": limit is not None and (len(existing) + len(docs)) >= limit}
+
 @app.post("/api/migrate")
 @limiter.limit("3/hour")
 async def migrate_data(request: Request, body: MigrateRequest, user=Depends(get_current_user)):
