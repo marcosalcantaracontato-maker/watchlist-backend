@@ -1,0 +1,159 @@
+# Testes das funções PURAS do server.py — as que quebram silenciosamente:
+# similaridade, classificação de 429, extração de texto/tags, status de vídeo,
+# serialização. Nenhum teste toca rede ou Mongo.
+from datetime import datetime, timedelta
+
+from bson import ObjectId
+from jose import jwt as jose_jwt
+
+import server
+
+
+# ── _cosine ───────────────────────────────────────────────────────────────────
+def test_cosine_identical_is_one():
+    v = [0.5, -0.2, 0.8]
+    assert abs(server._cosine(v, v) - 1.0) < 1e-9
+
+def test_cosine_orthogonal_is_zero():
+    assert abs(server._cosine([1, 0], [0, 1])) < 1e-9
+
+def test_cosine_opposite_is_minus_one():
+    assert abs(server._cosine([1, 2], [-1, -2]) + 1.0) < 1e-9
+
+def test_cosine_empty_or_none_is_zero():
+    assert server._cosine([], [1, 2]) == 0.0
+    assert server._cosine(None, [1, 2]) == 0.0
+    assert server._cosine([0, 0], [1, 2]) == 0.0   # norma zero não divide por zero
+
+
+# ── _is_daily_quota_429 (PerDay queima a chave; PerMinute NÃO) ────────────────
+def _gemini_429(quota_id="", metric=""):
+    return {"error": {"details": [{"violations": [{"quotaId": quota_id, "quotaMetric": metric}]}]}}
+
+def test_quota_429_per_day_is_daily():
+    assert server._is_daily_quota_429(_gemini_429("GenerateRequestsPerDayPerProjectPerModel")) is True
+
+def test_quota_429_per_day_in_metric_is_daily():
+    assert server._is_daily_quota_429(_gemini_429("", "generate_requests_PerDay")) is True
+
+def test_quota_429_per_minute_is_transient():
+    assert server._is_daily_quota_429(_gemini_429("GenerateRequestsPerMinutePerProjectPerModel")) is False
+
+def test_quota_429_without_details_is_transient():
+    # Na dúvida, NÃO matar a chave o dia todo.
+    assert server._is_daily_quota_429({}) is False
+    assert server._is_daily_quota_429({"error": {"message": "rate limited"}}) is False
+    assert server._is_daily_quota_429({"error": {"details": "not-a-list"}}) is False
+
+
+# ── rotação de chaves: exaustão é por (chave, modelo) e por DIA ───────────────
+def test_gemini_keys_available_excludes_exhausted_today(monkeypatch):
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    monkeypatch.setattr(server, "GEMINI_KEYS", ["k1", "k2"])
+    monkeypatch.setattr(server, "_gemini_exhausted", {("k1", "m"): today})
+    assert server._gemini_keys_available("m") == ["k2"]
+    # outro modelo não é afetado pela exaustão de "m"
+    assert server._gemini_keys_available("outro") == ["k1", "k2"]
+
+def test_gemini_keys_available_resets_next_day(monkeypatch):
+    yesterday = (datetime.utcnow() - timedelta(days=1)).strftime("%Y-%m-%d")
+    monkeypatch.setattr(server, "GEMINI_KEYS", ["k1"])
+    monkeypatch.setattr(server, "_gemini_exhausted", {("k1", "m"): yesterday})
+    assert server._gemini_keys_available("m") == ["k1"]
+
+
+# ── _html_to_text (readability) ───────────────────────────────────────────────
+def test_html_to_text_prefers_article():
+    html = "<nav>menu ruim</nav><article><p>Conteúdo &amp; ideia.</p></article><footer>x</footer>"
+    out = server._html_to_text(html)
+    assert "Conteúdo & ideia." in out
+    assert "menu ruim" not in out
+
+def test_html_to_text_strips_script_and_style():
+    html = "<main><script>alert(1)</script><style>.a{}</style><p>Texto real</p></main>"
+    out = server._html_to_text(html)
+    assert "Texto real" in out
+    assert "alert" not in out and ".a{}" not in out
+
+def test_html_to_text_blocks_become_newlines():
+    out = server._html_to_text("<p>um</p><p>dois</p>")
+    assert out.splitlines()[0].strip() == "um"
+    assert "dois" in out
+
+
+# ── _extract_tags (parse defensivo da resposta do LLM) ────────────────────────
+def test_extract_tags_parses_array():
+    assert server._extract_tags('["Marketing", "Facebook Ads"]') == ["Marketing", "Facebook Ads"]
+
+def test_extract_tags_ignores_text_around():
+    assert server._extract_tags('Claro! Aqui: ["IA"] espero que ajude') == ["IA"]
+
+def test_extract_tags_caps_at_four():
+    assert len(server._extract_tags('["a","b","c","d","e","f"]')) == 4
+
+def test_extract_tags_garbage_is_empty():
+    assert server._extract_tags("desculpe, não sei") == []
+    assert server._extract_tags("") == []
+
+
+# ── _yt_video_id ──────────────────────────────────────────────────────────────
+def test_yt_video_id_variants():
+    vid = "dQw4w9WgXcQ"
+    assert server._yt_video_id(f"https://www.youtube.com/watch?v={vid}") == vid
+    assert server._yt_video_id(f"https://youtu.be/{vid}") == vid
+    assert server._yt_video_id(f"https://www.youtube.com/embed/{vid}") == vid
+    assert server._yt_video_id(f"https://www.youtube.com/shorts/{vid}") == vid
+    assert server._yt_video_id("https://vimeo.com/123") == ""
+
+
+# ── progresso / status de vídeo ───────────────────────────────────────────────
+def test_progress_pct():
+    assert server._progress_pct({"watched": True}) == 100
+    assert server._progress_pct({"durationSeconds": 100, "watchedSeconds": 50}) == 50
+    assert server._progress_pct({"durationSeconds": 0, "watchedSeconds": 50}) == 0
+    assert server._progress_pct({}) == 0
+
+def test_video_status_completed_and_not_started():
+    assert server._video_status({"watched": True}) == "completed"
+    assert server._video_status({"durationSeconds": 100, "watchedSeconds": 95}) == "completed"
+    assert server._video_status({}) == "not_started"
+
+def test_video_status_abandoned_vs_in_progress():
+    old = (datetime.utcnow() - timedelta(days=20)).isoformat()
+    halfway_old = {"durationSeconds": 100, "watchedSeconds": 50, "lastWatchedAt": old}
+    assert server._video_status(halfway_old) == "abandoned"
+    recent = (datetime.utcnow() - timedelta(days=2)).isoformat()
+    halfway_recent = {"durationSeconds": 100, "watchedSeconds": 50, "lastWatchedAt": recent}
+    assert server._video_status(halfway_recent) == "in_progress"
+
+
+# ── serialize / deserialize_doc ───────────────────────────────────────────────
+def test_serialize_strips_server_only_fields_and_converts():
+    oid = ObjectId()
+    when = datetime(2026, 6, 1, 12, 0, 0)
+    doc = {"_id": oid, "title": "x", "createdAt": when,
+           "topicEmbedding": [0.1] * 8, "contentText": "segredo grande"}
+    out = server.serialize(dict(doc))
+    assert out["id"] == str(oid)
+    assert "topicEmbedding" not in out and "contentText" not in out
+    assert out["createdAt"] == when.isoformat()
+
+def test_serialize_none_passthrough():
+    assert server.serialize(None) is None
+
+def test_deserialize_doc_roundtrip_preserves_id_and_dates():
+    oid = ObjectId()
+    when = datetime(2026, 6, 1, 12, 0, 0)
+    ser = server.serialize({"_id": oid, "createdAt": when, "title": "t"})
+    back = server.deserialize_doc(ser)
+    assert back["_id"] == oid
+    assert isinstance(back["createdAt"], datetime)
+    assert back["createdAt"] == when
+
+
+# ── JWT ───────────────────────────────────────────────────────────────────────
+def test_create_jwt_roundtrip():
+    token = server.create_jwt("user-123")
+    claims = jose_jwt.decode(token, server.JWT_SECRET, algorithms=[server.ALGORITHM])
+    assert claims["sub"] == "user-123"
+    assert claims["exp"] > datetime.utcnow().timestamp()

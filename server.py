@@ -1748,6 +1748,8 @@ async def _yt_search(query: str, n: int = 1) -> list:
     return []
 
 def _cosine(a, b) -> float:
+    if not a or not b:   # None/vazio (doc sem embedding) → sem similaridade, sem crash
+        return 0.0
     s = sum(x * y for x, y in zip(a, b))
     na = math.sqrt(sum(x * x for x in a)); nb = math.sqrt(sum(x * x for x in b))
     return s / (na * nb) if na and nb else 0.0
