@@ -1468,7 +1468,7 @@ async def home_layout(user=Depends(get_current_user)):
     return {"version": 1, "user_state": user_state, "generated_at": datetime.utcnow().isoformat(), "sections": sections}
 
 # ─── IA (Fase 2): auto-tagging por LLM + embeddings (OpenAI) ───────────────────
-import math, json as _json, re as _re
+import math, json as _json, re as _re, asyncio
 
 _TAG_SYS = ("Você gera TAGS DE TÓPICO para um vídeo a partir do título. Responda APENAS "
             "um array JSON com 2 a 4 tags curtas em português (1-2 palavras, Capitalizadas), "
@@ -1675,6 +1675,26 @@ async def _summarize(title: str, text: str) -> str:
     )
     return await _chat(prompt, 600, temperature=0.3)
 
+async def _link_meta_line(doc: dict, user_id: str) -> str:
+    """Linha com o que o USUÁRIO sabe sobre o link: título + categoria + tags +
+    plataforma. É o que torna respondível 'o vídeo do TikTok na categoria W' —
+    mesmo quando a página não entrega texto nenhum (TikTok/Instagram)."""
+    cat = ""
+    if doc.get("categoryId"):
+        try:
+            c = await db.categories.find_one({"_id": ObjectId(doc["categoryId"]), "userId": user_id}, {"name": 1})
+            cat = (c or {}).get("name", "")
+        except Exception:
+            pass
+    parts = [doc.get("title") or doc.get("url", "")]
+    if cat:
+        parts.append(f"Categoria: {cat}")
+    if doc.get("tags"):
+        parts.append("Tags: " + ", ".join(doc["tags"][:6]))
+    if doc.get("platform") and doc["platform"] != "other":
+        parts.append(f"Plataforma: {doc['platform']}")
+    return " · ".join(p for p in parts if p)
+
 async def _embed_note(note_id: str, user_id: str):
     """Nota → embedding (segundo cérebro inclui o que VOCÊ escreveu, não só o que salvou).
     Grava None quando o texto é curto demais — marca como processada sem re-tentar."""
@@ -1733,17 +1753,20 @@ async def _enrich_link(link_id: str, user_id: str):
             if summary:
                 updates["aiSummary"] = summary
 
-    # CHUNKS com timestamp (1x por link): vídeo → segmentos do timedtext (carregam o
-    # MINUTO de cada trecho → o RAG cita "aos 12:30" e o clique abre o vídeo ali);
-    # artigo/post → chunks por sentença. Vetor por chunk via batchEmbedContents.
-    if not doc.get("chunksAt"):
+    # CHUNKS com timestamp (1x por link, versão 2): vídeo → segmentos do timedtext
+    # (carregam o MINUTO → o RAG cita "aos 12:30"); artigo → chunks por sentença.
+    # SEMPRE inclui um chunk-meta (idx 0) com título+categoria+tags+plataforma —
+    # garante que TODO link exista no Q&A, até TikTok/Instagram sem texto extraível.
+    if doc.get("chunksVer") != 2:
         vid = doc.get("videoId", "")
-        chunks = []
         if vid:
             segs = await _yt_transcript_segments(vid)
             chunks = _chunk_segments(segs) if segs else _chunk_text(content or "")
         else:
             chunks = _chunk_text(content or "")
+        meta = await _link_meta_line(doc, user_id)
+        if meta:
+            chunks = [{"t": None, "text": meta}] + chunks
         if chunks:
             vecs = await _ai_embeddings_batch([c["text"] for c in chunks])
             rows = [{"userId": user_id, "linkId": link_id, "idx": i,
@@ -1754,10 +1777,12 @@ async def _enrich_link(link_id: str, user_id: str):
                     await db.chunks.delete_many({"linkId": link_id, "userId": user_id})
                     await db.chunks.insert_many(rows)
                     updates["chunksAt"] = datetime.utcnow()
+                    updates["chunksVer"] = 2
                 except Exception:
                     pass
         else:
-            updates["chunksAt"] = datetime.utcnow()   # sem texto → não fica re-tentando
+            updates["chunksAt"] = datetime.utcnow()
+            updates["chunksVer"] = 2   # sem nada p/ indexar → não fica re-tentando
     try:
         await db.links.update_one({"_id": doc["_id"], "userId": user_id},
                                   {"$set": updates, "$inc": {"aiTries": 1}})
@@ -2127,7 +2152,10 @@ async def library_map(user=Depends(get_current_user)):
             "direto e pessoal, em português, sem jargão técnico. Não invente além dos dados.\n"
             f"Total: {total} conteúdos.\nCategorias (nome (itens)): {cats_str}\nTemas: {topics_str}"
         )
-        summary = await _chat(prompt, 240, models=GEMINI_SMART_MODELS)
+        try:   # prazo máximo: IA lenta/fora NÃO pode segurar o mapa — abre sem o resumo
+            summary = await asyncio.wait_for(_chat(prompt, 240, models=GEMINI_SMART_MODELS), 25)
+        except Exception:
+            summary = ""
     return {"total": total, "summary": summary, "strengths": strengths, "gaps": gaps, "topics": topics, "orphan": orphan, "tree": tree}
 
 _insights_cache = {}  # uid -> (ts, n_items, result)
@@ -2256,7 +2284,10 @@ async def ai_insights(user=Depends(get_current_user)):
             "NÃO invente nada que não esteja nos fatos. Responda APENAS um array JSON: "
             '[{"icon":"<1 emoji>","text":"<frase>"}].\n\nFATOS:\n' + "\n".join(facts)
         )
-        txt = await _chat(prompt, 420, temperature=0.4, models=GEMINI_SMART_MODELS)
+        try:   # prazo máximo: sem IA, cai no fallback determinístico abaixo
+            txt = await asyncio.wait_for(_chat(prompt, 420, temperature=0.4, models=GEMINI_SMART_MODELS), 25)
+        except Exception:
+            txt = ""
         try:
             m = _re.search(r"\[.*\]", txt, _re.S)
             if m:
@@ -2356,11 +2387,14 @@ async def review_queue(user=Depends(get_current_user)):
     if need_q and _ai_enabled():
         lst = "\n\n".join(f"{i+1}. Título: {l.get('title','')}\nResumo: {(l.get('aiSummary') or '')[:400]}"
                           for i, (_, l) in enumerate(need_q))
-        txt = await _chat(
-            "Para cada conteúdo abaixo, gere UMA pergunta curta de revisão ativa, em português, que "
-            "teste se a pessoa LEMBRA da ideia central — sem entregar a resposta na pergunta. "
-            'Responda APENAS um array JSON de strings, na mesma ordem: ["pergunta 1", ...]\n\n' + lst,
-            400, temperature=0.4)
+        try:   # prazo máximo: sem IA, cai na pergunta-fallback por título
+            txt = await asyncio.wait_for(_chat(
+                "Para cada conteúdo abaixo, gere UMA pergunta curta de revisão ativa, em português, que "
+                "teste se a pessoa LEMBRA da ideia central — sem entregar a resposta na pergunta. "
+                'Responda APENAS um array JSON de strings, na mesma ordem: ["pergunta 1", ...]\n\n' + lst,
+                400, temperature=0.4), 25)
+        except Exception:
+            txt = ""
         try:
             m = _re.search(r"\[.*\]", txt, _re.S)
             for (lid, _), q_ in zip(need_q, _json.loads(m.group(0)) if m else []):
@@ -2496,6 +2530,57 @@ async def ai_ask(req: AskReq, user=Depends(get_current_user)):
             sources.append({"kind": "note", "id": str(n["_id"]), "title": n.get("title") or "Sua nota",
                             "url": "", "thumb": "", "videoId": "", "t": None})
 
+    # ── Busca por PALAVRA-CHAVE (título/categoria/tags/plataforma) ──────────────
+    # Pega o que o usuário NOMEIA — "categoria W", "tiktok" — mesmo sem match
+    # semântico (links sem texto extraível, nomes curtos de categoria etc.).
+    cats_all = await db.categories.find({"userId": uid}, {"name": 1}).to_list(3000)
+    cname = {str(c["_id"]): (c.get("name") or "") for c in cats_all}
+    catnames = {(c.get("name") or "").strip().lower() for c in cats_all}
+    plats = {"youtube", "tiktok", "instagram", "twitter", "x", "vimeo", "spotify", "twitch"}
+    stop = {"de", "do", "da", "em", "no", "na", "um", "uma", "ou", "que", "ser", "pode", "sobre",
+            "video", "vídeo", "videos", "vídeos", "categoria", "tag", "tags", "plataforma",
+            "qual", "quais", "meu", "minha", "meus", "minhas", "tem", "tenho", "salvei", "salvo"}
+    toks = [t for t in _re.split(r"[^\wà-ÿ]+", q.lower()) if t]
+    sig = [t for t in toks if (len(t) >= 3 and t not in stop) or t in catnames or t in plats]
+    kw_docs = []
+    if sig:
+        meta_docs = await db.links.find({"userId": uid},
+            {"title": 1, "url": 1, "rawThumb": 1, "videoId": 1, "platform": 1,
+             "tags": 1, "categoryId": 1, "aiSummary": 1}).to_list(8000)
+        scored_kw = []
+        for d in meta_docs:
+            hay = ((d.get("title") or "") + " " + " ".join(d.get("tags") or []) + " "
+                   + cname.get(d.get("categoryId") or "", "") + " " + (d.get("platform") or "")).lower()
+            hits = sum(1 for t in sig if t in hay)
+            if hits:
+                scored_kw.append((hits, d))
+        scored_kw.sort(key=lambda x: -x[0])
+        kw_docs = [d for _, d in scored_kw[:3]]
+
+    def _meta_of(d: dict) -> str:
+        parts = [d.get("title") or d.get("url", "")]
+        cn = cname.get(d.get("categoryId") or "", "")
+        if cn:
+            parts.append(f"Categoria: {cn}")
+        if d.get("tags"):
+            parts.append("Tags: " + ", ".join(d["tags"][:6]))
+        if d.get("platform") and d["platform"] != "other":
+            parts.append(f"Plataforma: {d['platform']}")
+        return " · ".join(p for p in parts if p)
+
+    def _append_kw(blocks: list, sources: list, present: set):
+        for d in kw_docs:
+            did = str(d["_id"])
+            if did in present:
+                continue
+            present.add(did)
+            i = len(blocks) + 1
+            body = (d.get("aiSummary") or "")[:300]
+            blocks.append(f"[{i}] {_meta_of(d)}\n{body}".strip())
+            thumb = d.get("rawThumb") or (f"https://img.youtube.com/vi/{d.get('videoId')}/hqdefault.jpg" if d.get("videoId") else "")
+            sources.append({"kind": "link", "id": did, "title": d.get("title", ""), "url": d.get("url", ""),
+                            "thumb": thumb, "videoId": d.get("videoId", ""), "t": None})
+
     # ── Caminho 1 (preferido): CHUNKS com timestamp — recupera TRECHOS, não links
     # inteiros, e cita o MINUTO do vídeo (fonte ganha "t" → o front abre em ?t=).
     cvecs = await db.chunks.find({"userId": uid}, {"embedding": 1, "linkId": 1}).to_list(20000)
@@ -2531,6 +2616,7 @@ async def ai_ask(req: AskReq, user=Depends(get_current_user)):
             sources.append({"kind": "link", "id": c["linkId"], "title": ld.get("title", ""),
                             "url": ld.get("url", ""), "thumb": thumb, "videoId": ld.get("videoId", ""),
                             "t": int(t) if isinstance(t, (int, float)) else None})
+        _append_kw(blocks, sources, {s["id"] for s in sources})
         _append_notes(blocks, sources)
         ctx = "\n\n".join(blocks)[:9000]
         prompt = (
@@ -2539,8 +2625,10 @@ async def ai_ask(req: AskReq, user=Depends(get_current_user)):
             "número entre colchetes (ex.: [1], [3]) ao usar a informação; quando o trecho tiver um "
             "tempo (ex.: 'aos 12:30'), mencione-o — o usuário pode abrir o vídeo naquele ponto. "
             "Trechos marcados como 'SUA NOTA' são anotações do próprio usuário — dê peso a eles como "
-            "conclusões pessoais. Se a resposta NÃO estiver nos trechos, diga claramente que não "
-            "encontrou isso no acervo — NÃO invente.\n\n"
+            "conclusões pessoais. Se a pergunta pede para LOCALIZAR um conteúdo salvo, aponte o(s) "
+            "candidato(s) mais prováveis entre os trechos (cite [n]) e diga por quê — use os metadados "
+            "(Categoria/Tags/Plataforma) e aceite correspondência parcial; só diga que não encontrou "
+            "se NENHUM trecho for plausível. Fora isso, NÃO invente.\n\n"
             f"PERGUNTA: {q}\n\nTRECHOS DO ACERVO:\n{ctx}"
         )
         answer = await _chat(prompt, 700, temperature=0.3)
@@ -2553,10 +2641,10 @@ async def ai_ask(req: AskReq, user=Depends(get_current_user)):
     sims = [(_cosine(emb, d["topicEmbedding"]), d["_id"]) for d in docs if d.get("topicEmbedding")]
     sims.sort(key=lambda x: -x[0])
     top_ids = [did for s, did in sims[:8] if s > 0.22]
-    if not top_ids and not note_docs:
+    if not top_ids and not note_docs and not kw_docs:
         return {"answer": "Não encontrei nada relacionado a isso no seu acervo.", "sources": []}
     top_docs = await db.links.find({"_id": {"$in": top_ids}, "userId": uid},
-        {"title": 1, "url": 1, "rawThumb": 1, "videoId": 1,
+        {"title": 1, "url": 1, "rawThumb": 1, "videoId": 1, "platform": 1, "tags": 1, "categoryId": 1,
          "contentText": 1, "aiSummary": 1, "aiTopics": 1}).to_list(len(top_ids)) if top_ids else []
     pos = {did: i for i, did in enumerate(top_ids)}
     top = sorted(top_docs, key=lambda d: pos.get(d["_id"], 99))   # preserva o ranking
@@ -2565,10 +2653,11 @@ async def ai_ask(req: AskReq, user=Depends(get_current_user)):
         body = (d.get("contentText") or d.get("aiSummary") or "")[:900]
         if not body:
             body = ", ".join(d.get("aiTopics") or [])
-        blocks.append(f"[{i}] {d.get('title','')}\n{body}".strip())
+        blocks.append(f"[{i}] {_meta_of(d)}\n{body}".strip())
         thumb = d.get("rawThumb") or (f"https://img.youtube.com/vi/{d.get('videoId')}/hqdefault.jpg" if d.get("videoId") else "")
         sources.append({"kind": "link", "id": str(d["_id"]), "title": d.get("title", ""), "url": d.get("url", ""),
                         "thumb": thumb, "videoId": d.get("videoId", ""), "t": None})
+    _append_kw(blocks, sources, {s["id"] for s in sources})
     _append_notes(blocks, sources)
     ctx = "\n\n".join(blocks)[:8000]
     prompt = (
@@ -2576,8 +2665,10 @@ async def ai_ask(req: AskReq, user=Depends(get_current_user)):
         "acervo dele abaixo. Sintetize de forma útil e objetiva, em português. CITE as fontes pelo "
         "número entre colchetes (ex.: [1], [3]) ao usar a informação. Trechos marcados como 'SUA "
         "NOTA' são anotações do próprio usuário — dê peso a eles como conclusões pessoais. Se a "
-        "resposta NÃO estiver nos trechos, diga claramente que não encontrou isso no acervo — NÃO "
-        "invente.\n\n"
+        "pergunta pede para LOCALIZAR um conteúdo salvo, aponte o(s) candidato(s) mais prováveis "
+        "entre os trechos (cite [n]) e diga por quê — use os metadados (Categoria/Tags/Plataforma) "
+        "e aceite correspondência parcial; só diga que não encontrou se NENHUM trecho for plausível. "
+        "Fora isso, NÃO invente.\n\n"
         f"PERGUNTA: {q}\n\nTRECHOS DO ACERVO:\n{ctx}"
     )
     answer = await _chat(prompt, 700, temperature=0.3)
@@ -2673,7 +2764,7 @@ async def ai_backfill(background: BackgroundTasks, user=Depends(get_current_user
         return {"ok": False, "reason": "no_key", "remaining": 0}
     uid = str(user["_id"])
     q = {"userId": uid, "$and": [
-        {"$or": [{"aiEnrichedAt": {"$exists": False}}, {"topicEmbedding": {"$exists": False}}, {"contentText": {"$exists": False}}, {"aiSummary": {"$exists": False}}, {"chunksAt": {"$exists": False}}]},
+        {"$or": [{"aiEnrichedAt": {"$exists": False}}, {"topicEmbedding": {"$exists": False}}, {"contentText": {"$exists": False}}, {"aiSummary": {"$exists": False}}, {"chunksVer": {"$ne": 2}}]},
         {"$or": [{"aiTries": {"$exists": False}}, {"aiTries": {"$lt": 3}}]},
     ]}
     remaining = await db.links.count_documents(q)
