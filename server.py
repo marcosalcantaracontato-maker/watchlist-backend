@@ -2319,6 +2319,88 @@ async def ai_related(link_id: str, user=Depends(get_current_user)):
                         "platform": d.get("platform", "other"), "watched": bool(d.get("watched"))})
     return {"results": results}
 
+# ─── REVISÃO ATIVA (repetição espaçada) ──────────────────────────────────────
+# Transforma a biblioteca de arquivo passivo em APRENDIZADO: conteúdo consumido
+# vira card de revisão ("lembra qual era a tese?"). Intervalos: lembrei→x2.5,
+# vago→x1.3, esqueci→volta p/ 1 dia. 1ª revisão 3 dias após consumir.
+
+@app.get("/api/review/queue")
+async def review_queue(user=Depends(get_current_user)):
+    uid = str(user["_id"])
+    now = datetime.utcnow()
+    links = await db.links.find(
+        {"userId": uid, "watched": True, "aiSummary": {"$exists": True, "$ne": ""}},
+        {"title": 1, "rawThumb": 1, "videoId": 1, "url": 1, "aiSummary": 1, "watchedAt": 1}).to_list(4000)
+    if not links:
+        return {"cards": [], "total": 0}
+    by_id = {str(l["_id"]): l for l in links}
+    revs = {r["linkId"]: r for r in await db.reviews.find({"userId": uid}).to_list(8000)}
+    due = []
+    for lid, l in by_id.items():
+        r = revs.get(lid)
+        if r is None:
+            wa = l.get("watchedAt")
+            first = (wa if isinstance(wa, datetime) else now) + timedelta(days=3)
+            if first <= now:
+                due.append((first, lid, None))
+        elif isinstance(r.get("due"), datetime) and r["due"] <= now:
+            due.append((r["due"], lid, r))
+    due.sort(key=lambda x: x[0])
+    batch = due[:5]
+    if not batch:
+        return {"cards": [], "total": 0}
+
+    # Pergunta de recall: gerada UMA vez por card (1 chamada p/ o lote), salva no review.
+    need_q = [(lid, by_id[lid]) for _, lid, r in batch if not (r or {}).get("question")]
+    questions = {}
+    if need_q and _ai_enabled():
+        lst = "\n\n".join(f"{i+1}. Título: {l.get('title','')}\nResumo: {(l.get('aiSummary') or '')[:400]}"
+                          for i, (_, l) in enumerate(need_q))
+        txt = await _chat(
+            "Para cada conteúdo abaixo, gere UMA pergunta curta de revisão ativa, em português, que "
+            "teste se a pessoa LEMBRA da ideia central — sem entregar a resposta na pergunta. "
+            'Responda APENAS um array JSON de strings, na mesma ordem: ["pergunta 1", ...]\n\n' + lst,
+            400, temperature=0.4)
+        try:
+            m = _re.search(r"\[.*\]", txt, _re.S)
+            for (lid, _), q_ in zip(need_q, _json.loads(m.group(0)) if m else []):
+                questions[lid] = str(q_).strip()[:300]
+        except Exception:
+            pass
+
+    cards = []
+    for due_at, lid, r in batch:
+        l = by_id[lid]
+        q_ = (r or {}).get("question") or questions.get(lid) \
+            or f"O que você lembra de \"{(l.get('title') or '')[:80]}\"?"
+        await db.reviews.update_one({"userId": uid, "linkId": lid},
+            {"$setOnInsert": {"interval": 3, "due": due_at, "createdAt": now},
+             "$set": {"question": q_}}, upsert=True)
+        thumb = l.get("rawThumb") or (f"https://img.youtube.com/vi/{l.get('videoId')}/hqdefault.jpg" if l.get("videoId") else "")
+        cards.append({"id": lid, "title": l.get("title", ""), "url": l.get("url", ""),
+                      "thumb": thumb, "question": q_, "answer": l.get("aiSummary", "")})
+    return {"cards": cards, "total": len(due)}
+
+class ReviewAnswer(BaseModel):
+    linkId: str = ""
+    result: str = "lembrei"   # lembrei | vago | esqueci
+
+@app.post("/api/review/answer")
+async def review_answer(req: ReviewAnswer, user=Depends(get_current_user)):
+    uid = str(user["_id"])
+    r = await db.reviews.find_one({"userId": uid, "linkId": req.linkId}) or {}
+    interval = float(r.get("interval") or 3)
+    if req.result == "esqueci":
+        interval = 1.0
+    elif req.result == "vago":
+        interval = max(2.0, interval * 1.3)
+    else:
+        interval = min(180.0, interval * 2.5)   # teto de ~6 meses
+    await db.reviews.update_one({"userId": uid, "linkId": req.linkId},
+        {"$set": {"interval": interval, "due": datetime.utcnow() + timedelta(days=interval),
+                  "lastResult": req.result, "answeredAt": datetime.utcnow()}}, upsert=True)
+    return {"ok": True, "nextDays": round(interval)}
+
 _topics_cache = {}  # uid -> (ts, n_items, result) — evita reclusterizar/renomear a cada abertura
 
 @app.get("/api/ai/topics")
@@ -3158,6 +3240,8 @@ async def startup():
     await db.backups.create_index([("userId", 1), ("type", 1), ("createdAt", -1)])
     # Chunks (RAG com timestamp)
     await db.chunks.create_index([("userId", 1), ("linkId", 1)])
+    # Revisão ativa
+    await db.reviews.create_index([("userId", 1), ("linkId", 1)], unique=True)
 
     # Migração: backfill 'position' em notas antigas (a partir do updatedAt em ms)
     try:
