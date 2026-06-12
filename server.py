@@ -302,6 +302,7 @@ def serialize(doc) -> dict:
     doc["id"] = str(doc.pop("_id"))
     doc.pop("topicEmbedding", None)  # vetor grande — fica só no servidor
     doc.pop("contentText", None)     # texto extraído (grande) — só no servidor (busca/RAG)
+    doc.pop("noteEmbedding", None)   # vetor da nota — só no servidor (RAG)
     for k, v in doc.items():
         if isinstance(v, ObjectId):
             doc[k] = str(v)
@@ -1236,7 +1237,7 @@ async def get_notes(
     return [serialize(n) async for n in cursor]
 
 @app.post("/api/notes")
-async def create_note(body: NoteCreate, user=Depends(get_current_user)):
+async def create_note(body: NoteCreate, background: BackgroundTasks, user=Depends(get_current_user)):
     now = datetime.utcnow()
     folder_id = body.folderId if body.folderId not in ("__inbox__", "") else None
     # Default position: ms timestamp (newer = higher rank = appears at top)
@@ -1258,13 +1259,18 @@ async def create_note(body: NoteCreate, user=Depends(get_current_user)):
     }
     result = await db.notes.insert_one(doc)
     doc["_id"] = result.inserted_id
+    if _ai_enabled():
+        background.add_task(_embed_note, str(result.inserted_id), str(user["_id"]))
     return serialize(doc)
 
 @app.patch("/api/notes/{note_id}")
-async def update_note(note_id: str, body: NoteUpdate, user=Depends(get_current_user)):
+async def update_note(note_id: str, body: NoteUpdate, background: BackgroundTasks, user=Depends(get_current_user)):
     updates = {k: v for k, v in body.dict().items() if v is not None}
     if not updates:
         raise HTTPException(status_code=400, detail="Nada para atualizar")
+    # Texto mudou → re-embeda em background (o RAG responde com a versão atual)
+    if _ai_enabled() and ("title" in updates or "body" in updates):
+        background.add_task(_embed_note, note_id, str(user["_id"]))
     # Normaliza inbox sentinel
     if updates.get("folderId") in ("__inbox__", ""):
         updates["folderId"] = None
@@ -1668,6 +1674,23 @@ async def _summarize(title: str, text: str) -> str:
         f"TÍTULO: {title}\n\nCONTEÚDO:\n{text[:6000]}"
     )
     return await _chat(prompt, 600, temperature=0.3)
+
+async def _embed_note(note_id: str, user_id: str):
+    """Nota → embedding (segundo cérebro inclui o que VOCÊ escreveu, não só o que salvou).
+    Grava None quando o texto é curto demais — marca como processada sem re-tentar."""
+    if not _ai_enabled():
+        return
+    try:
+        doc = await db.notes.find_one({"_id": ObjectId(note_id), "userId": user_id},
+                                      {"title": 1, "body": 1})
+        if not doc:
+            return
+        text = ((doc.get("title") or "") + "\n" + (doc.get("body") or "")).strip()
+        vec = await _ai_embedding(text) if len(text) >= 20 else None
+        await db.notes.update_one({"_id": doc["_id"], "userId": user_id},
+                                  {"$set": {"noteEmbedding": vec}})
+    except Exception:
+        pass
 
 async def _enrich_link(link_id: str, user_id: str):
     """Job em background: extrai o CONTEÚDO REAL (1x), gera aiTopics + embedding SOBRE o
@@ -2372,6 +2395,25 @@ async def ai_ask(req: AskReq, user=Depends(get_current_user)):
     emb = await _ai_embedding(q)
     if not emb:
         return {"answer": "Não consegui buscar agora (embeddings indisponíveis).", "sources": []}
+    # ── Notas do PRÓPRIO usuário também respondem ("o que EU concluí sobre X") ──
+    nvecs = await db.notes.find({"userId": uid, "noteEmbedding": {"$exists": True}, "deletedAt": None},
+                                {"noteEmbedding": 1}).to_list(4000)
+    nsims = [(_cosine(emb, n.get("noteEmbedding")), n["_id"]) for n in nvecs]
+    nsims.sort(key=lambda x: -x[0])
+    note_ids = [nid for s, nid in nsims[:3] if s > 0.28]
+    note_docs = []
+    if note_ids:
+        nd = {n["_id"]: n for n in await db.notes.find(
+            {"_id": {"$in": note_ids}}, {"title": 1, "body": 1}).to_list(len(note_ids))}
+        note_docs = [nd[nid] for nid in note_ids if nid in nd]
+
+    def _append_notes(blocks: list, sources: list):
+        for n in note_docs:
+            i = len(blocks) + 1
+            blocks.append(f"[{i}] SUA NOTA: {n.get('title') or 'sem título'}\n{(n.get('body') or '')[:700]}".strip())
+            sources.append({"kind": "note", "id": str(n["_id"]), "title": n.get("title") or "Sua nota",
+                            "url": "", "thumb": "", "videoId": "", "t": None})
+
     # ── Caminho 1 (preferido): CHUNKS com timestamp — recupera TRECHOS, não links
     # inteiros, e cita o MINUTO do vídeo (fonte ganha "t" → o front abre em ?t=).
     cvecs = await db.chunks.find({"userId": uid}, {"embedding": 1, "linkId": 1}).to_list(20000)
@@ -2404,17 +2446,19 @@ async def ai_ask(req: AskReq, user=Depends(get_current_user)):
             stamp = f" (aos {int(t)//60}:{int(t)%60:02d})" if isinstance(t, (int, float)) else ""
             blocks.append(f"[{i}] {ld.get('title','')}{stamp}\n{(ch.get('text') or '')[:900]}".strip())
             thumb = ld.get("rawThumb") or (f"https://img.youtube.com/vi/{ld.get('videoId')}/hqdefault.jpg" if ld.get("videoId") else "")
-            sources.append({"id": c["linkId"], "title": ld.get("title", ""), "url": ld.get("url", ""),
-                            "thumb": thumb, "videoId": ld.get("videoId", ""),
+            sources.append({"kind": "link", "id": c["linkId"], "title": ld.get("title", ""),
+                            "url": ld.get("url", ""), "thumb": thumb, "videoId": ld.get("videoId", ""),
                             "t": int(t) if isinstance(t, (int, float)) else None})
+        _append_notes(blocks, sources)
         ctx = "\n\n".join(blocks)[:9000]
         prompt = (
             "Você é o 'segundo cérebro' do usuário. Responda à PERGUNTA usando SOMENTE os trechos do "
             "acervo dele abaixo. Sintetize de forma útil e objetiva, em português. CITE as fontes pelo "
             "número entre colchetes (ex.: [1], [3]) ao usar a informação; quando o trecho tiver um "
-            "tempo (ex.: 'aos 12:30'), mencione-o — o usuário pode abrir o vídeo naquele ponto. Se a "
-            "resposta NÃO estiver nos trechos, diga claramente que não encontrou isso no acervo — NÃO "
-            "invente.\n\n"
+            "tempo (ex.: 'aos 12:30'), mencione-o — o usuário pode abrir o vídeo naquele ponto. "
+            "Trechos marcados como 'SUA NOTA' são anotações do próprio usuário — dê peso a eles como "
+            "conclusões pessoais. Se a resposta NÃO estiver nos trechos, diga claramente que não "
+            "encontrou isso no acervo — NÃO invente.\n\n"
             f"PERGUNTA: {q}\n\nTRECHOS DO ACERVO:\n{ctx}"
         )
         answer = await _chat(prompt, 700, temperature=0.3)
@@ -2427,33 +2471,34 @@ async def ai_ask(req: AskReq, user=Depends(get_current_user)):
     sims = [(_cosine(emb, d["topicEmbedding"]), d["_id"]) for d in docs if d.get("topicEmbedding")]
     sims.sort(key=lambda x: -x[0])
     top_ids = [did for s, did in sims[:8] if s > 0.22]
-    if not top_ids:
+    if not top_ids and not note_docs:
         return {"answer": "Não encontrei nada relacionado a isso no seu acervo.", "sources": []}
     top_docs = await db.links.find({"_id": {"$in": top_ids}, "userId": uid},
         {"title": 1, "url": 1, "rawThumb": 1, "videoId": 1,
-         "contentText": 1, "aiSummary": 1, "aiTopics": 1}).to_list(len(top_ids))
+         "contentText": 1, "aiSummary": 1, "aiTopics": 1}).to_list(len(top_ids)) if top_ids else []
     pos = {did: i for i, did in enumerate(top_ids)}
     top = sorted(top_docs, key=lambda d: pos.get(d["_id"], 99))   # preserva o ranking
-    blocks = []
+    blocks, sources = [], []
     for i, d in enumerate(top, 1):
         body = (d.get("contentText") or d.get("aiSummary") or "")[:900]
         if not body:
             body = ", ".join(d.get("aiTopics") or [])
         blocks.append(f"[{i}] {d.get('title','')}\n{body}".strip())
+        thumb = d.get("rawThumb") or (f"https://img.youtube.com/vi/{d.get('videoId')}/hqdefault.jpg" if d.get("videoId") else "")
+        sources.append({"kind": "link", "id": str(d["_id"]), "title": d.get("title", ""), "url": d.get("url", ""),
+                        "thumb": thumb, "videoId": d.get("videoId", ""), "t": None})
+    _append_notes(blocks, sources)
     ctx = "\n\n".join(blocks)[:8000]
     prompt = (
         "Você é o 'segundo cérebro' do usuário. Responda à PERGUNTA usando SOMENTE os trechos do "
         "acervo dele abaixo. Sintetize de forma útil e objetiva, em português. CITE as fontes pelo "
-        "número entre colchetes (ex.: [1], [3]) ao usar a informação. Se a resposta NÃO estiver nos "
-        "trechos, diga claramente que não encontrou isso no acervo — NÃO invente.\n\n"
+        "número entre colchetes (ex.: [1], [3]) ao usar a informação. Trechos marcados como 'SUA "
+        "NOTA' são anotações do próprio usuário — dê peso a eles como conclusões pessoais. Se a "
+        "resposta NÃO estiver nos trechos, diga claramente que não encontrou isso no acervo — NÃO "
+        "invente.\n\n"
         f"PERGUNTA: {q}\n\nTRECHOS DO ACERVO:\n{ctx}"
     )
     answer = await _chat(prompt, 700, temperature=0.3)
-    sources = []
-    for d in top:
-        thumb = d.get("rawThumb") or (f"https://img.youtube.com/vi/{d.get('videoId')}/hqdefault.jpg" if d.get("videoId") else "")
-        sources.append({"id": str(d["_id"]), "title": d.get("title", ""), "url": d.get("url", ""),
-                        "thumb": thumb, "videoId": d.get("videoId", ""), "t": None})
     return {"answer": answer or "Não consegui gerar a resposta agora.", "sources": sources}
 
 @app.post("/api/ai/gemini")
@@ -2553,7 +2598,12 @@ async def ai_backfill(background: BackgroundTasks, user=Depends(get_current_user
     pending = await db.links.find(q).limit(40).to_list(40)   # lote por chamada (extração é mais pesada)
     for l in pending:
         background.add_task(_enrich_link, str(l["_id"]), uid)
-    return {"ok": True, "queued": len(pending), "remaining": remaining}
+    # Notas antigas sem embedding entram no mesmo ciclo (RAG inclui o que VOCÊ escreveu)
+    nq = {"userId": uid, "deletedAt": None, "noteEmbedding": {"$exists": False}}
+    n_remaining = await db.notes.count_documents(nq)
+    for n in await db.notes.find(nq, {"_id": 1}).limit(20).to_list(20):
+        background.add_task(_embed_note, str(n["_id"]), uid)
+    return {"ok": True, "queued": len(pending), "remaining": remaining + n_remaining}
 
 # ─── METADATA FETCH ──────────────────────────────────────────────────────────
 def _yt_video_id(url: str) -> str:
