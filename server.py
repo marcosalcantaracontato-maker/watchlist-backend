@@ -1092,9 +1092,9 @@ async def link_exists(url: str = "", videoId: str = "", user=Depends(get_current
     É só uma CONSULTA AO BANCO — NÃO usa IA, NÃO gasta token. Custo ~nada."""
     uid = str(user["_id"])
     vid = (videoId or _yt_video_id(url)) if (videoId or url) else ""
-    q = {"userId": uid, "videoId": vid} if vid else {"userId": uid, "url": url}
     if not (vid or url):
         return {"saved": False}
+    q = {"userId": uid, "videoId": vid} if vid else {"userId": uid, "urlKey": _url_key(url)}
     doc = await db.links.find_one(q, {"categoryId": 1, "title": 1})
     if not doc:
         return {"saved": False}
@@ -1112,9 +1112,11 @@ async def create_link(body: LinkCreate, background: BackgroundTasks, user=Depend
         if count >= 300:
             raise HTTPException(status_code=403, detail="Limite de 300 links no plano Free atingido")
 
-    # Dedup: já está salvo? (videoId p/ vídeos; url exata p/ o resto) → idempotente
+    # Dedup canônico: videoId (vídeos) OU urlKey normalizado (ignora www/barra/
+    # protocolo/tracking) → idempotente mesmo com variações da mesma URL.
+    ukey = _url_key(body.url)
     dup_q = ({"userId": str(user["_id"]), "videoId": body.videoId}
-             if body.videoId else {"userId": str(user["_id"]), "url": body.url})
+             if body.videoId else {"userId": str(user["_id"]), "urlKey": ukey})
     existing = await db.links.find_one(dup_q)
     if existing:
         return {"linkId": str(existing["_id"]), "duplicate": True}
@@ -1122,6 +1124,7 @@ async def create_link(body: LinkCreate, background: BackgroundTasks, user=Depend
     doc = {
         "userId":     str(user["_id"]),
         "url":        body.url,
+        "urlKey":     ukey,
         "title":      body.title,
         "thumbnail":  body.thumbnail,
         "rawThumb":   body.rawThumb,
@@ -1687,6 +1690,37 @@ def _unwrap_url(url: str) -> str:
         pass
     return url
 
+_TRACK_PARAMS = {"utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
+                 "fbclid", "gclid", "gclsrc", "dclid", "msclkid", "mc_eid", "mc_cid",
+                 "igshid", "si", "feature", "ref", "ref_src", "spm", "_ga", "yclid", "ttclid"}
+
+def _url_key(url: str) -> str:
+    """Chave CANÔNICA p/ dedup: ignora protocolo, www/m/mobile, barra final, caixa do
+    host, porta, fragmento e querystring de tracking. Faz
+    'youtube.com/x', 'www.youtube.com/x/', 'https://youtube.com/x', 'youtube.com/x#t'
+    virarem a MESMA chave. Para YouTube, ainda casa pelo videoId quando houver."""
+    try:
+        from urllib.parse import urlparse, parse_qsl, urlencode
+        raw = (url or "").strip()
+        if not raw:
+            return ""
+        if "://" not in raw:
+            raw = "http://" + raw            # normaliza URLs sem protocolo
+        u = urlparse(raw)
+        vid = _yt_video_id(raw)
+        if vid:
+            return f"yt:{vid}"               # qualquer forma do mesmo vídeo → mesma chave
+        host = (u.netloc or "").lower().split("@")[-1].split(":")[0]
+        for pre in ("www.", "m.", "mobile.", "pt.", "en."):
+            if host.startswith(pre):
+                host = host[len(pre):]
+        path = (u.path or "/").rstrip("/") or "/"
+        qs = sorted((k, v) for k, v in parse_qsl(u.query) if k.lower() not in _TRACK_PARAMS)
+        q = urlencode(qs)
+        return f"{host}{path}" + (f"?{q}" if q else "")
+    except Exception:
+        return (url or "").strip().lower()
+
 def _og_text(html: str) -> str:
     """og:title + og:description + meta description — o que QUALQUER página séria
     expõe pra previews, mesmo quando o corpo é 100% JavaScript."""
@@ -1929,6 +1963,8 @@ async def _enrich_link(link_id: str, user_id: str):
         "contentWords": words or 0,
         "readingTimeMin": max(1, round((words or 0) / 200)),
     }
+    if not doc.get("urlKey"):   # dedup canônico p/ links antigos (sem custo de IA)
+        updates["urlKey"] = _url_key(doc.get("url", ""))
     if topics:
         updates["aiTopics"] = list(dict.fromkeys(topics))   # temas de IA, separados das tags do usuário
     if emb:
@@ -2915,6 +2951,113 @@ async def ai_groq_proxy(req: GroqReq, user=Depends(get_current_user)):
                 last = {"status": r.status_code, "text": "", "error": msg}
     return last
 
+async def _cat_paths(uid: str):
+    """(by_id, paths) onde paths[cid] = 'Pai > Filho > Neto' e contagem de itens por cat."""
+    cats = await db.categories.find({"userId": uid}).to_list(3000)
+    by_id = {str(c["_id"]): c for c in cats}
+    counts = {}
+    async for l in db.links.find({"userId": uid}, {"categoryId": 1}):
+        cid = l.get("categoryId")
+        if cid:
+            counts[cid] = counts.get(cid, 0) + 1
+    def path_of(cid, seen=None):
+        seen = seen or set()
+        c = by_id.get(cid)
+        if not c or cid in seen:
+            return ""
+        seen.add(cid)
+        p = c.get("parentId")
+        pre = path_of(str(p), seen) if p else ""
+        return (pre + " > " if pre else "") + (c.get("name") or "")
+    return by_id, {cid: path_of(cid) for cid in by_id}, counts
+
+async def _resolve_path(uid: str, names: list) -> str:
+    """Acha/cria a cadeia de categorias (aninhada) e devolve o id da FOLHA. Reusa por
+    nome+pai (case-insensitive) — não duplica categoria que já existe."""
+    parent = None
+    leaf = None
+    for raw in names[:4]:   # profundidade máx 4 (sub-sub-sub)
+        name = (raw or "").strip()[:60]
+        if not name:
+            continue
+        existing = await db.categories.find_one(
+            {"userId": uid, "parentId": parent,
+             "name": {"$regex": f"^{_re.escape(name)}$", "$options": "i"}})
+        if existing:
+            leaf = str(existing["_id"])
+        else:
+            order = await db.categories.count_documents({"userId": uid, "parentId": parent})
+            res = await db.categories.insert_one(
+                {"userId": uid, "name": name, "parentId": parent, "order": order,
+                 "createdAt": datetime.utcnow(), "autoCreated": True})
+            leaf = str(res.inserted_id)
+        parent = leaf
+    return leaf or ""
+
+async def _auto_categorize_pending(uid: str, limit: int = 12) -> int:
+    """B (automático, alta qualidade): pega itens SEM categoria e, EM LOTE, decide o
+    melhor caminho de categoria pra cada um — reusando os existentes ou criando novos
+    (aninhados) quando faz sentido. Lote = 1 chamada de IA (barato e mais coerente que
+    decidir item a item). Itens ambíguos ficam sem categoria (não geram lixo)."""
+    if not _ai_enabled():
+        return 0
+    items = await db.links.find(
+        {"userId": uid, "autoCatAt": {"$exists": False},
+         "$or": [{"categoryId": None}, {"categoryId": {"$exists": False}}, {"categoryId": ""}]},
+        {"title": 1, "platform": 1, "aiSummary": 1, "aiTopics": 1, "url": 1}).limit(limit).to_list(limit)
+    if not items:
+        return 0
+    _by, paths, counts = await _cat_paths(uid)
+    tree = "\n".join(f"- {p}  ({counts.get(cid, 0)} itens)" for cid, p in sorted(paths.items(), key=lambda x: x[1]) if p) or "(você ainda não tem categorias)"
+    lst = "\n".join(
+        f'{i}. "{(it.get("title") or it.get("url",""))[:120]}"'
+        + (f' — resumo: {(it.get("aiSummary") or "")[:160]}' if it.get("aiSummary") else "")
+        + (f' — temas: {", ".join(it.get("aiTopics") or [])}' if it.get("aiTopics") else "")
+        + (f' [{it.get("platform")}]' if it.get("platform") and it["platform"] != "other" else "")
+        for i, it in enumerate(items))
+    prompt = (
+        "Você é um BIBLIOTECÁRIO especialista organizando uma biblioteca pessoal. Sua tarefa: dar a "
+        "CADA item abaixo o melhor CAMINHO de categoria. A QUALIDADE é crítica — categoria errada vira "
+        "lixo e estraga a biblioteca, então pense no ASSUNTO e no USO REAL de cada item (não em "
+        "palavras soltas do título).\n\n"
+        "REGRAS:\n"
+        "1) REUTILIZE um caminho que já existe sempre que ele servir (use exatamente o mesmo nome). Na "
+        "dúvida entre reusar e criar, REUTILIZE.\n"
+        "2) Só CRIE um caminho novo quando nenhum existente couber. Pode aninhar até 4 níveis "
+        "(ex.: ['Marketing','Tráfego Pago','Facebook Ads']). AGRUPE itens semelhantes no MESMO caminho "
+        "novo — não crie uma categoria para um único item se vários combinam.\n"
+        "3) Nomes curtos, claros, Capitalizados, em português. Não crie variações quase iguais "
+        "('IA' e 'Inteligência Artificial' devem ser UMA só).\n"
+        "4) Se um item for ambíguo/genérico demais pra classificar bem, devolva path: [] (deixa sem "
+        "categoria — melhor vazio que errado).\n"
+        + _rules_block(await _get_org_rules(uid)) +
+        f"\nCATEGORIAS EXISTENTES (caminho · contagem):\n{tree}\n\n"
+        f"ITENS A CLASSIFICAR:\n{lst}\n\n"
+        'Responda APENAS um array JSON, um objeto por item: [{"i":0,"path":["Pai","Filho"]}, ...]. '
+        "Use exatamente os nomes dos caminhos existentes quando reutilizar."
+    )
+    try:
+        txt = await asyncio.wait_for(_chat(prompt, 1200, temperature=0.2, models=GEMINI_SMART_MODELS), 40)
+        m = _re.search(r"\[.*\]", txt, _re.S)
+        arr = _json.loads(m.group(0)) if m else []
+    except Exception:
+        arr = []
+    assigned = {}
+    for a in arr:
+        if isinstance(a, dict) and isinstance(a.get("i"), int) and isinstance(a.get("path"), list):
+            assigned[a["i"]] = [str(x) for x in a["path"] if str(x).strip()]
+    done = 0
+    for i, it in enumerate(items):
+        upd = {"autoCatAt": datetime.utcnow()}   # marca como tentado (não reprocessa sempre)
+        path = assigned.get(i)
+        if path:
+            cid = await _resolve_path(uid, path)
+            if cid:
+                upd["categoryId"] = cid
+                done += 1
+        await db.links.update_one({"_id": it["_id"], "userId": uid}, {"$set": upd})
+    return done
+
 @app.post("/api/ai/backfill")
 async def ai_backfill(background: BackgroundTasks, user=Depends(get_current_user)):
     """Garante que TODO conteúdo (novo e antigo) tenha IA: enriquece em lotes os links
@@ -2936,7 +3079,15 @@ async def ai_backfill(background: BackgroundTasks, user=Depends(get_current_user
     n_remaining = await db.notes.count_documents(nq)
     for n in await db.notes.find(nq, {"_id": 1}).limit(20).to_list(20):
         background.add_task(_embed_note, str(n["_id"]), uid)
-    return {"ok": True, "queued": len(pending), "remaining": remaining + n_remaining}
+    # Auto-categorização (B): itens SEM categoria são organizados em lote pela IA.
+    # Roda APÓS o enriquecimento (usa resumo/temas) → só conta como pendente quando
+    # não há mais enriquecimento na fila, p/ categorizar com o máximo de contexto.
+    cq = {"userId": uid, "autoCatAt": {"$exists": False},
+          "$or": [{"categoryId": None}, {"categoryId": {"$exists": False}}, {"categoryId": ""}]}
+    cat_remaining = await db.links.count_documents(cq)
+    if cat_remaining and remaining == 0:
+        background.add_task(_auto_categorize_pending, uid)
+    return {"ok": True, "queued": len(pending), "remaining": remaining + n_remaining + cat_remaining}
 
 # ─── METADATA FETCH ──────────────────────────────────────────────────────────
 def _yt_video_id(url: str) -> str:
@@ -3485,21 +3636,22 @@ async def import_bulk(request: Request, req: BulkImportReq, user=Depends(get_cur
     if not items:
         return {"ok": True, "found": 0, "imported": 0, "skipped": 0}
 
-    existing = await db.links.find({"userId": uid}, {"videoId": 1, "url": 1}).to_list(8000)
+    existing = await db.links.find({"userId": uid}, {"videoId": 1, "urlKey": 1, "url": 1}).to_list(8000)
     have_v = {d.get("videoId") for d in existing if d.get("videoId")}
-    have_u = {d.get("url") for d in existing}
+    have_k = {d.get("urlKey") or _url_key(d.get("url", "")) for d in existing}
     limit = 300 if user.get("plan", "free") == "free" else None
     cat = req.categoryId if req.categoryId else None
     now = datetime.utcnow()
     docs, skipped = [], 0
     for it in items:
-        if (it["videoId"] and it["videoId"] in have_v) or it["url"] in have_u:
+        ukey = _url_key(it["url"])
+        if (it["videoId"] and it["videoId"] in have_v) or ukey in have_k:
             skipped += 1
             continue
         if limit is not None and len(existing) + len(docs) >= limit:
             break
         docs.append({
-            "userId": uid, "url": it["url"], "title": (it["title"] or it["url"])[:300],
+            "userId": uid, "url": it["url"], "urlKey": ukey, "title": (it["title"] or it["url"])[:300],
             "thumbnail": "", "rawThumb": "",
             "platform": "youtube" if it["videoId"] else "other",
             "videoId": it["videoId"] or "", "categoryId": cat,
@@ -3510,7 +3662,7 @@ async def import_bulk(request: Request, req: BulkImportReq, user=Depends(get_cur
         })
         if it["videoId"]:
             have_v.add(it["videoId"])
-        have_u.add(it["url"])
+        have_k.add(ukey)
     if docs:
         await db.links.insert_many(docs)
     return {"ok": True, "found": len(items), "imported": len(docs), "skipped": skipped,
@@ -3640,6 +3792,7 @@ async def startup():
     await db.categories.create_index([("userId", 1), ("order", 1)])
     await db.links.create_index([("userId", 1), ("createdAt", -1)])
     await db.links.create_index([("userId", 1), ("categoryId", 1)])
+    await db.links.create_index([("userId", 1), ("urlKey", 1)])   # dedup canônico
     # Notes indexes
     await db.notes.create_index([("userId", 1), ("position", -1)])
     await db.notes.create_index([("userId", 1), ("updatedAt", -1)])

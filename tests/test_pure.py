@@ -274,3 +274,26 @@ def test_parse_playlist_new_lockup_format():
     assert len(out) == 2
     assert out[0] == {"videoId": "dQw4w9WgXcQ", "title": "Rick Astley - Never Gonna Give You Up"}
     assert out[1]["title"] == "Outro Video"
+
+
+# ── _url_key: dedup canônico (protocolo/www/barra/tracking/forma de vídeo) ────
+def test_url_key_canonicalizes_variations():
+    base = server._url_key("https://www.youtube.com.br/fsajfsajfas")
+    assert server._url_key("www.youtube.com.br/fsajfsajfas/") == base
+    assert server._url_key("youtube.com.br/fsajfsajfas") == base
+    assert server._url_key("https://www.youtube.com.br/fsajfsajfas/") == base
+    assert server._url_key("http://youtube.com.br/fsajfsajfas#secao") == base
+
+def test_url_key_youtube_video_forms_match():
+    k = server._url_key("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+    assert k == "yt:dQw4w9WgXcQ"
+    assert server._url_key("https://youtu.be/dQw4w9WgXcQ") == k
+    assert server._url_key("https://m.youtube.com/watch?v=dQw4w9WgXcQ&t=10s") == k
+
+def test_url_key_strips_tracking_but_keeps_real_params():
+    a = server._url_key("https://site.com/p?id=42&utm_source=x&fbclid=abc")
+    b = server._url_key("https://site.com/p?id=42")
+    assert a == b
+
+def test_url_key_distinguishes_different_pages():
+    assert server._url_key("https://site.com/a") != server._url_key("https://site.com/b")
