@@ -15,7 +15,7 @@ from pydantic import BaseModel, Field
 from typing import List, Any
 from datetime import datetime, timedelta
 from bson import ObjectId
-import os, httpx
+import os, httpx, hmac as _hmac
 from dotenv import load_dotenv
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
@@ -27,6 +27,10 @@ load_dotenv()
 MONGODB_URL            = os.getenv("MONGODB_URL", "mongodb://localhost:27017")
 JWT_SECRET             = os.getenv("JWT_SECRET", "TROQUE_ISSO_POR_UM_SECRET_FORTE")
 GOOGLE_CLIENT_ID       = os.getenv("GOOGLE_CLIENT_ID", "")
+# Login de TESTE p/ automação (Playwright) — DESLIGADO por padrão. Só funciona se
+# TEST_LOGIN_SECRET estiver setado E a requisição mandar o mesmo segredo. Em produção,
+# sem a env var, o endpoint responde 404 (inerte). NÃO é um backdoor aberto.
+TEST_LOGIN_SECRET      = os.getenv("TEST_LOGIN_SECRET", "")
 ALGORITHM              = "HS256"
 TOKEN_EXPIRE_DAYS      = 30
 # E-mails com acesso ao painel admin (separados por vírgula). Ajuste no Railway.
@@ -516,6 +520,34 @@ async def health():
         return {"status": "ok", "db": "up"}
     except Exception as e:
         return {"status": "degraded", "db": "down", "error": str(e)}
+
+class TestLoginReq(BaseModel):
+    secret: str = ""
+
+@app.post("/api/auth/test-login")
+@limiter.limit("20/minute")
+async def test_login(request: Request, req: TestLoginReq, response: Response):
+    """SOMENTE p/ automação (Playwright testar o app LOGADO sem o OAuth do Google).
+    Gate de segurança: só responde se TEST_LOGIN_SECRET estiver setado no servidor E
+    o segredo enviado bater. Sem a env var → 404 (não existe pra produção). Loga num
+    usuário de teste DEDICADO (não toca contas reais)."""
+    if not TEST_LOGIN_SECRET:
+        raise HTTPException(status_code=404, detail="Not found")
+    if not _hmac.compare_digest(req.secret or "", TEST_LOGIN_SECRET):
+        raise HTTPException(status_code=403, detail="Segredo inválido")
+    email = "playwright-test@vitrine.local"
+    existing = await db.users.find_one({"email": email})
+    if existing:
+        user_id = str(existing["_id"])
+    else:
+        r = await db.users.insert_one({"email": email, "name": "Teste Playwright", "avatar": "",
+                                       "plan": "premium", "createdAt": datetime.utcnow(), "lastLogin": datetime.utcnow()})
+        user_id = str(r.inserted_id)
+    token = create_jwt(user_id)
+    user = await db.users.find_one({"_id": ObjectId(user_id)})
+    response.set_cookie(key=COOKIE_NAME, value=token, httponly=True, secure=True,
+                        samesite="none", max_age=TOKEN_EXPIRE_DAYS * 24 * 60 * 60, path="/")
+    return {"token": token, "user": serialize(user), "is_new": False}
 
 @app.post("/api/auth/google")
 @limiter.limit("5/minute")
