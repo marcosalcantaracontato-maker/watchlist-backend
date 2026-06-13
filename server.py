@@ -3642,6 +3642,8 @@ async def import_bulk(request: Request, req: BulkImportReq, user=Depends(get_cur
     limit = 300 if user.get("plan", "free") == "free" else None
     cat = req.categoryId if req.categoryId else None
     now = datetime.utcnow()
+    import uuid as _uuid
+    batch = _uuid.uuid4().hex[:12]   # identifica ESTE lote (p/ a barra de progresso)
     docs, skipped = [], 0
     for it in items:
         ukey = _url_key(it["url"])
@@ -3652,7 +3654,7 @@ async def import_bulk(request: Request, req: BulkImportReq, user=Depends(get_cur
             break
         docs.append({
             "userId": uid, "url": it["url"], "urlKey": ukey, "title": (it["title"] or it["url"])[:300],
-            "thumbnail": "", "rawThumb": "",
+            "thumbnail": "", "rawThumb": "", "importBatch": batch,
             "platform": "youtube" if it["videoId"] else "other",
             "videoId": it["videoId"] or "", "categoryId": cat,
             "watched": False, "notes": "", "tags": [], "order": 0,
@@ -3666,7 +3668,25 @@ async def import_bulk(request: Request, req: BulkImportReq, user=Depends(get_cur
     if docs:
         await db.links.insert_many(docs)
     return {"ok": True, "found": len(items), "imported": len(docs), "skipped": skipped,
+            "batch": batch if docs else "", "preCategorized": bool(cat),
             "limited": limit is not None and (len(existing) + len(docs)) >= limit}
+
+@app.get("/api/import/progress")
+async def import_progress(batch: str = "", user=Depends(get_current_user)):
+    """Progresso do enriquecimento de um LOTE de import (p/ a barra ao vivo):
+    quantos já foram lidos (conteúdo), ganharam temas/tags e foram categorizados."""
+    uid = str(user["_id"])
+    if not batch:
+        return {"total": 0, "done": True}
+    base = {"userId": uid, "importBatch": batch}
+    total = await db.links.count_documents(base)
+    enriched = await db.links.count_documents({**base, "aiEnrichedAt": {"$exists": True}})
+    tagged = await db.links.count_documents({**base, "aiTopics.0": {"$exists": True}})
+    categorized = await db.links.count_documents({**base, "categoryId": {"$nin": [None, ""]}})
+    cat_done = await db.links.count_documents({**base, "autoCatAt": {"$exists": True}})
+    done = total > 0 and enriched >= total and cat_done >= total
+    return {"total": total, "enriched": enriched, "tagged": tagged,
+            "categorized": categorized, "catProcessed": cat_done, "done": done}
 
 @app.post("/api/migrate")
 @limiter.limit("3/hour")
