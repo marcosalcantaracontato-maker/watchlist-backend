@@ -3615,6 +3615,21 @@ def _parse_playlist_page(html: str) -> list:
         _push(m.group(1), title)
     return out
 
+def _parse_playlist_rss(xml: str) -> list:
+    """Fallback: feed RSS público da playlist (fura consent/região). Traz os vídeos
+    mais recentes (~15). Cada <entry> tem <yt:videoId> + <title>. Puro."""
+    import html as _h
+    out, seen = [], set()
+    for ent in _re.split(r"<entry>", xml or "")[1:]:
+        mv = _re.search(r"<yt:videoId>([A-Za-z0-9_-]{11})</yt:videoId>", ent)
+        if not mv or mv.group(1) in seen:
+            continue
+        seen.add(mv.group(1))
+        mt = _re.search(r"<title>(.*?)</title>", ent, _re.S)
+        title = _h.unescape(mt.group(1)).strip() if mt else "Vídeo do YouTube"
+        out.append({"videoId": mv.group(1), "title": title or "Vídeo do YouTube"})
+    return out
+
 class BulkImportReq(BaseModel):
     kind: str = "bookmarks"           # bookmarks | playlist
     url: str = ""                     # playlist do YouTube (?list=)
@@ -3632,15 +3647,27 @@ async def import_bulk(request: Request, req: BulkImportReq, user=Depends(get_cur
         m = _re.search(r"[?&]list=([A-Za-z0-9_-]+)", req.url or "")
         if not m:
             raise HTTPException(status_code=400, detail="URL de playlist inválida (precisa conter ?list=)")
+        list_id = m.group(1)
+        vids = []
         try:
             async with httpx.AsyncClient(timeout=15, follow_redirects=True) as c:
-                r = await c.get(f"https://www.youtube.com/playlist?list={m.group(1)}",
-                                headers={"User-Agent": "Mozilla/5.0", "Accept-Language": "pt-BR,pt,en"})
-            vids = _parse_playlist_page(r.text)[:200]
+                r = await c.get(f"https://www.youtube.com/playlist?list={list_id}",
+                                headers={"User-Agent": _BROWSER_UA, "Accept-Language": "pt-BR,pt,en",
+                                         "Cookie": "CONSENT=YES+1"})
+                vids = _parse_playlist_page(r.text)[:200]
+                if not vids:   # consent/região/formato → tenta o feed RSS (público)
+                    rss = await c.get(f"https://www.youtube.com/feeds/videos.xml?playlist_id={list_id}")
+                    if rss.status_code == 200:
+                        vids = _parse_playlist_rss(rss.text)
         except Exception:
             raise HTTPException(status_code=502, detail="Não consegui ler a playlist agora")
         items = [{"url": f"https://www.youtube.com/watch?v={v['videoId']}", "title": v["title"],
                   "videoId": v["videoId"]} for v in vids]
+        if not items:
+            # Conseguiu acessar mas não listou vídeos → provável playlist privada, Mix/rádio
+            # (list=RD…), "Curtidos"/"Assistir mais tarde" (exigem login) ou vazia.
+            return {"ok": True, "found": 0, "imported": 0, "skipped": 0,
+                    "reason": "Não consegui ler os vídeos — playlists privadas, Mix/rádio (RD…), 'Curtidos' ou 'Assistir mais tarde' exigem login e não dá para importar de fora. Use uma playlist pública."}
     else:
         items = [{"url": b["url"], "title": b["title"], "videoId": _yt_video_id(b["url"])}
                  for b in _parse_bookmarks_html(req.html or "")[:500]]
