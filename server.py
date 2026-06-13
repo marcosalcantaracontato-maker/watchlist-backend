@@ -3001,8 +3001,10 @@ async def _auto_categorize_pending(uid: str, limit: int = 12) -> int:
     decidir item a item). Itens ambíguos ficam sem categoria (não geram lixo)."""
     if not _ai_enabled():
         return 0
+    # Só categoriza itens JÁ enriquecidos (têm resumo/temas) → qualidade alta E a barra
+    # de "Categorias" anda junto com a leitura, em vez de ficar parada até o fim.
     items = await db.links.find(
-        {"userId": uid, "autoCatAt": {"$exists": False},
+        {"userId": uid, "autoCatAt": {"$exists": False}, "aiEnrichedAt": {"$exists": True},
          "$or": [{"categoryId": None}, {"categoryId": {"$exists": False}}, {"categoryId": ""}]},
         {"title": 1, "platform": 1, "aiSummary": 1, "aiTopics": 1, "url": 1}).limit(limit).to_list(limit)
     if not items:
@@ -3085,7 +3087,8 @@ async def ai_backfill(background: BackgroundTasks, user=Depends(get_current_user
     cq = {"userId": uid, "autoCatAt": {"$exists": False},
           "$or": [{"categoryId": None}, {"categoryId": {"$exists": False}}, {"categoryId": ""}]}
     cat_remaining = await db.links.count_documents(cq)
-    if cat_remaining and remaining == 0:
+    # Roda JUNTO com o enriquecimento (categoriza só os já lidos) → barra anda ao vivo.
+    if cat_remaining:
         background.add_task(_auto_categorize_pending, uid)
     return {"ok": True, "queued": len(pending), "remaining": remaining + n_remaining + cat_remaining}
 
