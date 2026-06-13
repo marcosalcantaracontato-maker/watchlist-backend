@@ -2671,179 +2671,142 @@ async def ai_topics(user=Depends(get_current_user)):
 
 @app.post("/api/ai/ask")
 async def ai_ask(req: AskReq, user=Depends(get_current_user)):
-    """Pergunte à sua biblioteca (RAG): recupera os conteúdos mais relevantes por
-    embedding e a IA SINTETIZA a resposta USANDO SÓ o acervo, com CITAÇÕES [n]."""
+    """Assistente do segundo cérebro. A IA recebe a ESTRUTURA REAL da biblioteca
+    (categorias + itens + plataformas) E os TRECHOS relevantes do conteúdo — então
+    responde tanto perguntas de ORGANIZAÇÃO ('quantas categorias tenho', 'qual item
+    na categoria W') quanto de CONTEÚDO ('o que aprendi sobre X', com citações [n])."""
     uid = str(user["_id"])
     q = (req.q or "").strip()[:400]
     if not q:
         return {"answer": "", "sources": []}
     if not _ai_enabled():
         return {"answer": "IA não configurada.", "sources": []}
-    emb = await _ai_embedding(q)
-    if not emb:
-        return {"answer": "Não consegui buscar agora (embeddings indisponíveis).", "sources": []}
-    # ── Notas do PRÓPRIO usuário também respondem ("o que EU concluí sobre X") ──
-    nvecs = await db.notes.find({"userId": uid, "noteEmbedding": {"$exists": True}, "deletedAt": None},
-                                {"noteEmbedding": 1}).to_list(4000)
-    nsims = [(_cosine(emb, n.get("noteEmbedding")), n["_id"]) for n in nvecs]
-    nsims.sort(key=lambda x: -x[0])
-    note_ids = [nid for s, nid in nsims[:3] if s > 0.28]
-    note_docs = []
-    if note_ids:
-        nd = {n["_id"]: n for n in await db.notes.find(
-            {"_id": {"$in": note_ids}}, {"title": 1, "body": 1}).to_list(len(note_ids))}
-        note_docs = [nd[nid] for nid in note_ids if nid in nd]
+    ql = q.lower()
+    uname = (user.get("name") or "").split(" ")[0]
 
-    def _append_notes(blocks: list, sources: list):
-        for n in note_docs:
+    # ── Carrega a biblioteca inteira (leve) + categorias ──────────────────────
+    cats_all = await db.categories.find({"userId": uid}, {"name": 1, "parentId": 1}).to_list(3000)
+    cname = {str(c["_id"]): (c.get("name") or "") for c in cats_all}
+    links = await db.links.find({"userId": uid},
+        {"title": 1, "url": 1, "rawThumb": 1, "videoId": 1, "platform": 1,
+         "tags": 1, "categoryId": 1, "aiSummary": 1, "topicEmbedding": 1}).to_list(8000)
+    total = len(links)
+    if total == 0:
+        return {"answer": "Sua biblioteca ainda está vazia — salve alguns conteúdos e eu passo a responder sobre eles.", "sources": []}
+
+    def _src(d, t=None):
+        thumb = d.get("rawThumb") or (f"https://img.youtube.com/vi/{d.get('videoId')}/hqdefault.jpg" if d.get("videoId") else "")
+        return {"kind": "link", "id": str(d["_id"]), "title": d.get("title", ""), "url": d.get("url", ""),
+                "thumb": thumb, "videoId": d.get("videoId", ""), "t": t}
+
+    # ── ESTRUTURA: categorias (com contagem) + plataformas ────────────────────
+    by_cat, plat_count = {}, {}
+    for l in links:
+        by_cat.setdefault(l.get("categoryId") or "__none__", []).append(l)
+        p = (l.get("platform") or "outros")
+        plat_count[p] = plat_count.get(p, 0) + 1
+    cat_counts = sorted(((cname.get(cid, "Sem categoria") if cid != "__none__" else "Sem categoria",
+                          cid, len(items)) for cid, items in by_cat.items()), key=lambda x: -x[2])
+
+    # categorias citadas na pergunta (match por nome, com fronteira de palavra)
+    mentioned = []
+    for nm, cid, n in cat_counts:
+        low = (nm or "").strip().lower()
+        if low and low != "sem categoria" and _re.search(rf"(?<!\w){_re.escape(low)}(?!\w)", ql):
+            mentioned.append(cid)
+
+    struct = [f"Total: {total} conteúdos · {len([c for c in cat_counts if c[1] != '__none__'])} categorias.",
+              "PLATAFORMAS: " + ", ".join(f"{p} ({n})" for p, n in sorted(plat_count.items(), key=lambda x: -x[1])),
+              "CATEGORIAS (nome · qtd):"]
+    shown_items = 0
+    for nm, cid, n in cat_counts:
+        struct.append(f"- {nm} ({n})")
+        # lista os títulos dos itens p/ categorias citadas ou pequenas (até um teto global)
+        if (cid in mentioned or n <= 4) and shown_items < 80:
+            for it in by_cat[cid][:25]:
+                struct.append(f"    • {(it.get('title') or it.get('url',''))[:90]}"
+                              + (f"  [{it.get('platform')}]" if it.get("platform") and it["platform"] != "other" else ""))
+                shown_items += 1
+    struct_text = "\n".join(struct)[:6000]
+
+    # ── CONTEÚDO relevante: embedding sobre chunks (com timestamp) + notas ─────
+    blocks, sources, seen = [], [], set()
+    emb = await _ai_embedding(q)
+    if emb:
+        cvecs = await db.chunks.find({"userId": uid}, {"embedding": 1, "linkId": 1}).to_list(20000)
+        csims = sorted(((_cosine(emb, c.get("embedding")), c) for c in cvecs), key=lambda x: -x[0])
+        per_link, picked = {}, []
+        for s, c in csims:
+            if s < 0.22 or len(picked) >= 8:
+                break
+            if per_link.get(c["linkId"], 0) >= 2:
+                continue
+            per_link[c["linkId"]] = per_link.get(c["linkId"], 0) + 1
+            picked.append((s, c))
+        if picked:
+            chunk_full = {c["_id"]: c for c in await db.chunks.find(
+                {"_id": {"$in": [c["_id"] for _, c in picked]}}, {"text": 1, "t": 1, "linkId": 1}).to_list(len(picked))}
+            ldocs = {str(d["_id"]): d for d in links}
+            for s, c in picked:
+                ch = chunk_full.get(c["_id"]) or {}
+                ld = ldocs.get(c["linkId"])
+                if not ld:
+                    continue
+                t = ch.get("t")
+                stamp = f" (aos {int(t)//60}:{int(t)%60:02d})" if isinstance(t, (int, float)) else ""
+                i = len(blocks) + 1
+                blocks.append(f"[{i}] {ld.get('title','')}{stamp}\n{(ch.get('text') or '')[:800]}".strip())
+                sources.append(_src(ld, int(t) if isinstance(t, (int, float)) else None))
+                seen.add(str(ld["_id"]))
+        # notas do próprio usuário
+        nvecs = await db.notes.find({"userId": uid, "noteEmbedding": {"$exists": True}, "deletedAt": None},
+                                    {"noteEmbedding": 1}).to_list(4000)
+        nsims = sorted(((_cosine(emb, n.get("noteEmbedding")), n["_id"]) for n in nvecs), key=lambda x: -x[0])
+        nids = [nid for s, nid in nsims[:2] if s > 0.3]
+        for n in (await db.notes.find({"_id": {"$in": nids}}, {"title": 1, "body": 1}).to_list(len(nids)) if nids else []):
             i = len(blocks) + 1
-            blocks.append(f"[{i}] SUA NOTA: {n.get('title') or 'sem título'}\n{(n.get('body') or '')[:700]}".strip())
+            blocks.append(f"[{i}] SUA NOTA: {n.get('title') or 'sem título'}\n{(n.get('body') or '')[:600]}".strip())
             sources.append({"kind": "note", "id": str(n["_id"]), "title": n.get("title") or "Sua nota",
                             "url": "", "thumb": "", "videoId": "", "t": None})
 
-    # ── Busca por PALAVRA-CHAVE (título/categoria/tags/plataforma) ──────────────
-    # Pega o que o usuário NOMEIA — "categoria W", "tiktok" — mesmo sem match
-    # semântico (links sem texto extraível, nomes curtos de categoria etc.).
-    cats_all = await db.categories.find({"userId": uid}, {"name": 1}).to_list(3000)
-    cname = {str(c["_id"]): (c.get("name") or "") for c in cats_all}
-    catnames = {(c.get("name") or "").strip().lower() for c in cats_all}
-    plats = {"youtube", "tiktok", "instagram", "twitter", "x", "vimeo", "spotify", "twitch"}
-    stop = {"de", "do", "da", "em", "no", "na", "um", "uma", "ou", "que", "ser", "pode", "sobre",
-            "video", "vídeo", "videos", "vídeos", "categoria", "tag", "tags", "plataforma",
-            "qual", "quais", "meu", "minha", "meus", "minhas", "tem", "tenho", "salvei", "salvo"}
-    toks = [t for t in _re.split(r"[^\wà-ÿ]+", q.lower()) if t]
-    sig = [t for t in toks if (len(t) >= 3 and t not in stop) or t in catnames or t in plats]
-    kw_docs = []
-    if sig:
-        meta_docs = await db.links.find({"userId": uid},
-            {"title": 1, "url": 1, "rawThumb": 1, "videoId": 1, "platform": 1,
-             "tags": 1, "categoryId": 1, "aiSummary": 1}).to_list(8000)
-        scored_kw = []
-        for d in meta_docs:
-            hay = ((d.get("title") or "") + " " + " ".join(d.get("tags") or []) + " "
-                   + cname.get(d.get("categoryId") or "", "") + " " + (d.get("platform") or "")).lower()
-            hits = sum(1 for t in sig if t in hay)
-            if hits:
-                scored_kw.append((hits, d))
-        scored_kw.sort(key=lambda x: -x[0])
-        kw_docs = [d for _, d in scored_kw[:3]]
+    # itens das categorias citadas entram como fontes (mesmo sem match de conteúdo)
+    for cid in mentioned:
+        for it in by_cat.get(cid, [])[:8]:
+            if str(it["_id"]) not in seen:
+                seen.add(str(it["_id"]))
+                i = len(blocks) + 1
+                blocks.append(f"[{i}] {(it.get('title') or it.get('url',''))}"
+                               + (f" · Categoria: {cname.get(cid,'')}" if cname.get(cid) else "")
+                               + (f" · {it.get('platform')}" if it.get('platform') and it['platform'] != 'other' else ""))
+                sources.append(_src(it))
 
-    def _meta_of(d: dict) -> str:
-        parts = [d.get("title") or d.get("url", "")]
-        cn = cname.get(d.get("categoryId") or "", "")
-        if cn:
-            parts.append(f"Categoria: {cn}")
-        if d.get("tags"):
-            parts.append("Tags: " + ", ".join(d["tags"][:6]))
-        if d.get("platform") and d["platform"] != "other":
-            parts.append(f"Plataforma: {d['platform']}")
-        return " · ".join(p for p in parts if p)
+    content_text = ("\n\n".join(blocks))[:7000] if blocks else "(nenhum trecho de conteúdo recuperado)"
 
-    def _append_kw(blocks: list, sources: list, present: set):
-        for d in kw_docs:
-            did = str(d["_id"])
-            if did in present:
-                continue
-            present.add(did)
-            i = len(blocks) + 1
-            body = (d.get("aiSummary") or "")[:300]
-            blocks.append(f"[{i}] {_meta_of(d)}\n{body}".strip())
-            thumb = d.get("rawThumb") or (f"https://img.youtube.com/vi/{d.get('videoId')}/hqdefault.jpg" if d.get("videoId") else "")
-            sources.append({"kind": "link", "id": did, "title": d.get("title", ""), "url": d.get("url", ""),
-                            "thumb": thumb, "videoId": d.get("videoId", ""), "t": None})
-
-    # ── Caminho 1 (preferido): CHUNKS com timestamp — recupera TRECHOS, não links
-    # inteiros, e cita o MINUTO do vídeo (fonte ganha "t" → o front abre em ?t=).
-    cvecs = await db.chunks.find({"userId": uid}, {"embedding": 1, "linkId": 1}).to_list(20000)
-    picked = []
-    if cvecs:
-        csims = [(_cosine(emb, c.get("embedding")), c) for c in cvecs]
-        csims.sort(key=lambda x: -x[0])
-        per_link = {}
-        for s, c in csims:
-            if s < 0.25 or len(picked) >= 10:
-                break
-            lid = c["linkId"]
-            if per_link.get(lid, 0) >= 3:   # diversidade: máx 3 trechos do mesmo link
-                continue
-            per_link[lid] = per_link.get(lid, 0) + 1
-            picked.append((s, c))
-    if picked:
-        chunk_ids = [c["_id"] for _, c in picked]
-        full = {c["_id"]: c for c in await db.chunks.find(
-            {"_id": {"$in": chunk_ids}}, {"text": 1, "t": 1, "linkId": 1}).to_list(len(chunk_ids))}
-        link_ids = list(dict.fromkeys(c["linkId"] for _, c in picked))
-        ldocs = {str(d["_id"]): d for d in await db.links.find(
-            {"_id": {"$in": [ObjectId(l) for l in link_ids]}, "userId": uid},
-            {"title": 1, "url": 1, "rawThumb": 1, "videoId": 1}).to_list(len(link_ids))}
-        blocks, sources = [], []
-        for i, (s, c) in enumerate(picked, 1):
-            ch = full.get(c["_id"]) or {}
-            ld = ldocs.get(c["linkId"]) or {}
-            t = ch.get("t")
-            stamp = f" (aos {int(t)//60}:{int(t)%60:02d})" if isinstance(t, (int, float)) else ""
-            blocks.append(f"[{i}] {ld.get('title','')}{stamp}\n{(ch.get('text') or '')[:900]}".strip())
-            thumb = ld.get("rawThumb") or (f"https://img.youtube.com/vi/{ld.get('videoId')}/hqdefault.jpg" if ld.get("videoId") else "")
-            sources.append({"kind": "link", "id": c["linkId"], "title": ld.get("title", ""),
-                            "url": ld.get("url", ""), "thumb": thumb, "videoId": ld.get("videoId", ""),
-                            "t": int(t) if isinstance(t, (int, float)) else None})
-        _append_kw(blocks, sources, {s["id"] for s in sources})
-        _append_notes(blocks, sources)
-        ctx = "\n\n".join(blocks)[:9000]
-        prompt = (
-            "Você é o 'segundo cérebro' do usuário. Responda à PERGUNTA usando SOMENTE os trechos do "
-            "acervo dele abaixo. Sintetize de forma útil e objetiva, em português. CITE as fontes pelo "
-            "número entre colchetes (ex.: [1], [3]) ao usar a informação; quando o trecho tiver um "
-            "tempo (ex.: 'aos 12:30'), mencione-o — o usuário pode abrir o vídeo naquele ponto. "
-            "Trechos marcados como 'SUA NOTA' são anotações do próprio usuário — dê peso a eles como "
-            "conclusões pessoais. Se a pergunta pede para LOCALIZAR um conteúdo salvo, aponte o(s) "
-            "candidato(s) mais prováveis entre os trechos (cite [n]) e diga por quê — use os metadados "
-            "(Categoria/Tags/Plataforma) e aceite correspondência parcial; só diga que não encontrou "
-            "se NENHUM trecho for plausível. Fora isso, NÃO invente.\n\n"
-            f"PERGUNTA: {q}\n\nTRECHOS DO ACERVO:\n{ctx}"
-        )
-        answer = await _chat(prompt, 700, temperature=0.3)
-        return {"answer": answer or "Não consegui gerar a resposta agora.", "sources": sources}
-
-    # ── Caminho 2 (fallback): nível de LINK — biblioteca ainda sem chunks (backfill
-    # pendente) ou nenhum trecho relevante. 2 fases: vetores → texto só dos top-8.
-    docs = await db.links.find({"userId": uid, "topicEmbedding": {"$exists": True}},
-                               {"topicEmbedding": 1}).to_list(8000)
-    sims = [(_cosine(emb, d["topicEmbedding"]), d["_id"]) for d in docs if d.get("topicEmbedding")]
-    sims.sort(key=lambda x: -x[0])
-    top_ids = [did for s, did in sims[:8] if s > 0.22]
-    if not top_ids and not note_docs and not kw_docs:
-        return {"answer": "Não encontrei nada relacionado a isso no seu acervo.", "sources": []}
-    top_docs = await db.links.find({"_id": {"$in": top_ids}, "userId": uid},
-        {"title": 1, "url": 1, "rawThumb": 1, "videoId": 1, "platform": 1, "tags": 1, "categoryId": 1,
-         "contentText": 1, "aiSummary": 1, "aiTopics": 1}).to_list(len(top_ids)) if top_ids else []
-    pos = {did: i for i, did in enumerate(top_ids)}
-    top = sorted(top_docs, key=lambda d: pos.get(d["_id"], 99))   # preserva o ranking
-    blocks, sources = [], []
-    for i, d in enumerate(top, 1):
-        body = (d.get("contentText") or d.get("aiSummary") or "")[:900]
-        if not body:
-            body = ", ".join(d.get("aiTopics") or [])
-        blocks.append(f"[{i}] {_meta_of(d)}\n{body}".strip())
-        thumb = d.get("rawThumb") or (f"https://img.youtube.com/vi/{d.get('videoId')}/hqdefault.jpg" if d.get("videoId") else "")
-        sources.append({"kind": "link", "id": str(d["_id"]), "title": d.get("title", ""), "url": d.get("url", ""),
-                        "thumb": thumb, "videoId": d.get("videoId", ""), "t": None})
-    _append_kw(blocks, sources, {s["id"] for s in sources})
-    _append_notes(blocks, sources)
-    ctx = "\n\n".join(blocks)[:8000]
     prompt = (
-        "Você é o 'segundo cérebro' do usuário. Responda à PERGUNTA usando SOMENTE os trechos do "
-        "acervo dele abaixo. Sintetize de forma útil e objetiva, em português. CITE as fontes pelo "
-        "número entre colchetes (ex.: [1], [3]) ao usar a informação. Trechos marcados como 'SUA "
-        "NOTA' são anotações do próprio usuário — dê peso a eles como conclusões pessoais. Se a "
-        "pergunta pede para LOCALIZAR um conteúdo salvo, aponte o(s) candidato(s) mais prováveis "
-        "entre os trechos (cite [n]) e diga por quê — use os metadados (Categoria/Tags/Plataforma) "
-        "e aceite correspondência parcial; só diga que não encontrou se NENHUM trecho for plausível. "
-        "Fora isso, NÃO invente.\n\n"
-        f"PERGUNTA: {q}\n\nTRECHOS DO ACERVO:\n{ctx}"
+        f"Você é o assistente pessoal do segundo cérebro de {uname or 'do usuário'} — inteligente, "
+        "direto e perspicaz, como o ChatGPT/Claude, mas que CONHECE a biblioteca dele. Responda em "
+        "português, de forma natural e útil (sem ser robótico).\n\n"
+        "COMO USAR O CONTEXTO:\n"
+        "• Perguntas de ORGANIZAÇÃO (quantas/quais categorias, o que está na categoria X, em que "
+        "plataforma, quantos itens) → responda pela ESTRUTURA DA BIBLIOTECA. Ela é a verdade completa "
+        "sobre o acervo; pode contar e listar com confiança.\n"
+        "• Perguntas de CONTEÚDO (o que aprendi sobre X, resuma, sobre o que fala tal vídeo) → use os "
+        "TRECHOS DE CONTEÚDO e CITE as fontes com [n]. Quando um trecho tiver tempo ('aos 12:30'), "
+        "mencione — dá pra abrir o vídeo ali.\n"
+        "• Para LOCALIZAR algo ('qual vídeo de X', 'onde salvei Y') → cruze estrutura + trechos e "
+        "aponte o item mais provável citando [n], aceitando correspondência parcial. Só diga que não "
+        "achou se realmente não houver candidato plausível.\n"
+        "• NÃO invente conteúdo que não está no acervo, mas seja proativo: sugira o caminho, a "
+        "categoria ou o item mais próximo.\n\n"
+        f"=== ESTRUTURA DA BIBLIOTECA ===\n{struct_text}\n\n"
+        f"=== TRECHOS DE CONTEÚDO (fontes citáveis) ===\n{content_text}\n\n"
+        f"PERGUNTA: {q}"
     )
-    answer = await _chat(prompt, 700, temperature=0.3)
-    return {"answer": answer or "Não consegui gerar a resposta agora.", "sources": sources}
+    try:
+        answer = await asyncio.wait_for(_chat(prompt, 900, temperature=0.35, models=GEMINI_SMART_MODELS), 30)
+    except Exception:
+        answer = ""
+    return {"answer": answer or "Não consegui gerar a resposta agora — tente de novo.", "sources": sources}
 
 @app.post("/api/ai/gemini")
 async def ai_gemini_proxy(req: GeminiReq, user=Depends(get_current_user)):
