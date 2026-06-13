@@ -262,3 +262,15 @@ def test_tiktok_page_text_extracts_embedded_json():
 def test_tiktok_page_text_empty():
     assert server._tiktok_page_text("") == ""
     assert server._tiktok_page_text("<html>nada</html>") == ""
+
+
+def test_parse_playlist_new_lockup_format():
+    # Formato 2025+ (lockupViewModel): contentId VIDEO + accessibility label c/ duração
+    html = ('xx"contentId":"dQw4w9WgXcQ","contentType":"LOCKUP_CONTENT_TYPE_VIDEO",'
+            '"rendererContext":{"accessibilityContext":{"label":"Rick Astley - Never Gonna Give You Up 3 minutos e 32 segundos"}}'
+            'yy"contentId":"abcdefghijk","contentType":"LOCKUP_CONTENT_TYPE_VIDEO",'
+            '"accessibilityContext":{"label":"Outro Video 10 minutes, 5 seconds"}')
+    out = server._parse_playlist_page(html)
+    assert len(out) == 2
+    assert out[0] == {"videoId": "dQw4w9WgXcQ", "title": "Rick Astley - Never Gonna Give You Up"}
+    assert out[1]["title"] == "Outro Video"

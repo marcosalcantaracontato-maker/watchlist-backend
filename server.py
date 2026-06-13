@@ -1086,6 +1086,24 @@ async def get_links(
         "hasMore": (skip + limit) < total,
     }
 
+@app.get("/api/links/exists")
+async def link_exists(url: str = "", videoId: str = "", user=Depends(get_current_user)):
+    """Checa se um link JÁ está salvo (p/ a extensão indicar como o ⭐ dos favoritos).
+    É só uma CONSULTA AO BANCO — NÃO usa IA, NÃO gasta token. Custo ~nada."""
+    uid = str(user["_id"])
+    vid = (videoId or _yt_video_id(url)) if (videoId or url) else ""
+    q = {"userId": uid, "videoId": vid} if vid else {"userId": uid, "url": url}
+    if not (vid or url):
+        return {"saved": False}
+    doc = await db.links.find_one(q, {"categoryId": 1, "title": 1})
+    if not doc:
+        return {"saved": False}
+    cat = ""
+    if doc.get("categoryId"):
+        c = await db.categories.find_one({"_id": ObjectId(doc["categoryId"]), "userId": uid}, {"name": 1})
+        cat = (c or {}).get("name", "")
+    return {"saved": True, "id": str(doc["_id"]), "title": doc.get("title", ""), "category": cat}
+
 @app.post("/api/links")
 async def create_link(body: LinkCreate, background: BackgroundTasks, user=Depends(get_current_user)):
     # Free plan limit
@@ -3401,18 +3419,38 @@ def _parse_bookmarks_html(html: str) -> list:
     return out
 
 def _parse_playlist_page(html: str) -> list:
-    """HTML da página de playlist do YouTube → [{videoId, title}] (ordem, dedup). Puro."""
+    """HTML da página de playlist do YouTube → [{videoId, title}] (ordem, dedup). Puro.
+    Formato NOVO (2025+): lockupViewModel → contentId VIDEO + accessibilityContext.label
+    (a label = 'Título  duração'; removemos a duração). Fallback: playlistVideoRenderer."""
+    html = html or ""
     out, seen = [], set()
-    for m in _re.finditer(r'"videoId":"([A-Za-z0-9_-]{11})".{0,2000}?"title":\{"runs":\[\{"text":"((?:[^"\\]|\\.)*)"', html or ""):
-        vid = m.group(1)
-        if vid in seen:
-            continue
-        seen.add(vid)
+
+    def _push(vid, title):
+        if vid and vid not in seen:
+            seen.add(vid)
+            out.append({"videoId": vid, "title": (title or "").strip() or "Vídeo do YouTube"})
+
+    # Novo: contentId (vídeo) + label de acessibilidade logo em seguida
+    for m in _re.finditer(
+        r'"contentId":"([A-Za-z0-9_-]{11})","contentType":"LOCKUP_CONTENT_TYPE_VIDEO".{0,400}?'
+        r'"accessibilityContext":\{"label":"((?:[^"\\]|\\.)*)"', html, _re.S):
+        try:
+            label = _json.loads(f'"{m.group(2)}"')
+        except Exception:
+            label = m.group(2)
+        # tira o sufixo de duração ("3 minutos e 55 segundos" / "3 minutes, 55 seconds")
+        title = _re.sub(r"\s+\d+\s+(hora|minuto|segundo|hour|minute|second)s?\b.*$", "", label).strip()
+        _push(m.group(1), title or label)
+    if out:
+        return out
+
+    # Antigo: playlistVideoRenderer com title.runs
+    for m in _re.finditer(r'"videoId":"([A-Za-z0-9_-]{11})".{0,2000}?"title":\{"runs":\[\{"text":"((?:[^"\\]|\\.)*)"', html):
         try:
             title = _json.loads(f'"{m.group(2)}"')
         except Exception:
             title = m.group(2)
-        out.append({"videoId": vid, "title": title})
+        _push(m.group(1), title)
     return out
 
 class BulkImportReq(BaseModel):
