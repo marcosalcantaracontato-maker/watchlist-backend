@@ -1644,21 +1644,192 @@ async def _ai_embeddings_batch(texts: list) -> list:
         return out
     return [await _ai_embedding(t) for t in texts]   # fallback sequencial (OpenAI)
 
+# UA de navegador real: muitos sites bloqueiam "bots" declarados; e UA de crawler
+# de preview: paywalls/redes fechadas costumam servir as metatags OG pra ele.
+_BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+               "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+_CRAWLER_UA = "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)"
+
+def _unwrap_url(url: str) -> str:
+    """Desembrulha redirects (Google, Facebook, Instagram, Reddit) → URL real."""
+    try:
+        from urllib.parse import urlparse, parse_qs, unquote
+        p = urlparse(url or "")
+        host, qs = p.netloc.lower(), parse_qs(p.query)
+        if "google." in host and p.path == "/url":
+            for k in ("q", "url"):
+                if qs.get(k):
+                    return unquote(qs[k][0])
+        if host in ("l.facebook.com", "lm.facebook.com", "l.instagram.com") and qs.get("u"):
+            return unquote(qs["u"][0])
+        if host == "out.reddit.com" and qs.get("url"):
+            return unquote(qs["url"][0])
+    except Exception:
+        pass
+    return url
+
+def _og_text(html: str) -> str:
+    """og:title + og:description + meta description — o que QUALQUER página séria
+    expõe pra previews, mesmo quando o corpo é 100% JavaScript."""
+    import html as _h
+    out = []
+    for pat in (r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)',
+                r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:title["\']',
+                r'<meta[^>]+property=["\']og:description["\'][^>]+content=["\']([^"\']+)',
+                r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:description["\']',
+                r'<meta[^>]+name=["\']description["\'][^>]+content=["\']([^"\']+)'):
+        m = _re.search(pat, html or "", _re.I)
+        if m:
+            t = _re.sub(r"\s+", " ", _h.unescape(m.group(1))).strip()
+            if t and t not in out:
+                out.append(t)
+    return "\n".join(out)
+
+def _tiktok_page_text(html: str) -> str:
+    """Extrai do JSON EMBUTIDO na página do TikTok (nickname/bio/descrições) — o
+    oEmbed público parou de responder (400), mas a página ainda carrega tudo embutido.
+    Em página de vídeo, o 1º 'desc' é a legenda; em perfil, vem nome + bio + stats."""
+    out = []
+    def grab(pat, cap):
+        found = []
+        for m in _re.finditer(pat, html or ""):
+            try:
+                v = _json.loads('"' + m.group(1) + '"')
+            except Exception:
+                v = m.group(1)
+            v = v.strip()
+            if v and v not in found:
+                found.append(v)
+            if len(found) >= cap:
+                break
+        return found
+    nick  = grab(r'"nickname":"((?:[^"\\]|\\.){1,80})"', 1)
+    sig   = grab(r'"signature":"((?:[^"\\]|\\.){1,300})"', 1)
+    descs = grab(r'"desc":"((?:[^"\\]|\\.){5,300})"', 4)
+    if nick:
+        out.append(f"Criador(a) no TikTok: {nick[0]}")
+    if sig:
+        out.append(f"Bio: {sig[0]}")
+    out.extend(descs)
+    return "\n".join(out)
+
+async def _social_text(url: str) -> tuple:
+    """Extração POR PLATAFORMA via canais públicos (oEmbed/JSON/OG). ('', '') se não der."""
+    low = (url or "").lower()
+    try:
+        async with httpx.AsyncClient(timeout=12, follow_redirects=True) as c:
+            # TikTok — oEmbed (se voltar a funcionar) e, na prática, o JSON embutido da página
+            if "tiktok.com" in low:
+                try:
+                    r = await c.get("https://www.tiktok.com/oembed", params={"url": url})
+                    if r.status_code == 200:
+                        d = r.json()
+                        cap, author = (d.get("title") or "").strip(), (d.get("author_name") or "").strip()
+                        if cap or author:
+                            kind = "Vídeo" if "/video/" in low or "/photo/" in low else "Perfil"
+                            return (f"{kind} de {author} no TikTok. {('Legenda: ' + cap) if cap else ''}".strip(), "post")
+                except Exception:
+                    pass
+                r = await c.get(url, headers={"User-Agent": _BROWSER_UA, "Accept-Language": "pt-BR,pt,en"})
+                txt = _tiktok_page_text(r.text[:600000])
+                if txt:
+                    return (txt, "post")
+                og = _og_text(r.text[:300000])
+                if og and "make your day" not in og.lower():
+                    return (f"Perfil no TikTok. {og}", "post")
+            # X / Twitter — oEmbed público devolve o TEXTO do tweet
+            if "twitter.com" in low or "://x.com" in low:
+                r = await c.get("https://publish.twitter.com/oembed",
+                                params={"url": url, "omit_script": "1", "lang": "pt"})
+                if r.status_code == 200:
+                    d = r.json()
+                    txt = _re.sub(r"\s+", " ", _re.sub(r"<[^>]+>", " ", d.get("html") or "")).strip()
+                    if txt:
+                        return (f"Post de {d.get('author_name', '')} no X: {txt}", "post")
+            # Reddit — .json público: título + texto + top comentários
+            if "reddit.com" in low and "/comments/" in low:
+                r = await c.get(url.split("?")[0].rstrip("/") + ".json",
+                                headers={"User-Agent": _BROWSER_UA})
+                if r.status_code == 200:
+                    j = r.json()
+                    post = j[0]["data"]["children"][0]["data"] if isinstance(j, list) and j else {}
+                    parts = [post.get("title", ""), post.get("selftext", "")]
+                    try:
+                        for ch in j[1]["data"]["children"][:3]:
+                            b = ch.get("data", {}).get("body", "")
+                            if b:
+                                parts.append("Comentário: " + b)
+                    except Exception:
+                        pass
+                    txt = "\n".join(p for p in parts if p).strip()
+                    if txt:
+                        return (txt, "post")
+            # Vimeo — oEmbed com título + autor + descrição
+            if "vimeo.com" in low:
+                r = await c.get("https://vimeo.com/api/oembed.json", params={"url": url})
+                if r.status_code == 200:
+                    d = r.json()
+                    txt = "\n".join(x for x in (d.get("title", ""), d.get("author_name", ""), d.get("description", "")) if x)
+                    if txt:
+                        return (txt, "vídeo")
+            # Instagram / Facebook / LinkedIn — fechados: OG com UA de crawler de preview
+            if any(s in low for s in ("instagram.com", "facebook.com", "fb.watch", "linkedin.com")):
+                for ua in (_CRAWLER_UA, _BROWSER_UA):
+                    try:
+                        r = await c.get(url, headers={"User-Agent": ua, "Accept-Language": "pt-BR,pt,en"})
+                        og = _og_text(r.text[:300000])
+                        if len(og) > 30:
+                            return (og, "post")
+                    except Exception:
+                        continue
+    except Exception:
+        pass
+    return ("", "")
+
 async def _extract_content(url: str, platform: str, video_id: str):
-    """Texto REAL do conteúdo (o multiplicador): YouTube→transcrição (senão descrição);
-    página→texto principal (readability). Retorna (texto, tipo, nº_palavras)."""
+    """Texto REAL do conteúdo (o multiplicador): YouTube→transcrição; redes sociais→
+    canais públicos por plataforma; Google Docs→export; página→readability com UA de
+    navegador + fallback OG. Retorna (texto, tipo, nº_palavras)."""
+    url = _unwrap_url(url)
     text, ctype = "", "web"
+    low = (url or "").lower()
     try:
         if platform == "youtube" or video_id:
             ctype = "vídeo"
             text = (await _yt_transcript(video_id)) or (await _yt_description(video_id)) or ""
         elif url:
-            async with httpx.AsyncClient(timeout=12, follow_redirects=True) as c:
-                r = await c.get(url, headers={"User-Agent": "Mozilla/5.0 (compatible; WatchListBot/1.0)"})
-                text = _html_to_text(r.text[:500000])
-                low = url.lower()
-                if any(s in low for s in ("medium.", "substack", "/blog", "/article", "news", "dev.to")): ctype = "artigo"
-                elif any(s in low for s in ("linkedin.", "twitter.", "x.com", "instagram.", "tiktok.", "reddit.")): ctype = "post"
+            social = any(s in low for s in ("tiktok.", "twitter.", "://x.com", "instagram.",
+                                            "facebook.", "fb.watch", "linkedin.", "reddit.", "vimeo."))
+            if social:
+                text, st = await _social_text(url)
+                if st:
+                    ctype = st
+            if not text and "docs.google.com/document" in low:
+                m = _re.search(r"/document/d/([\w-]+)", url)
+                if m:
+                    async with httpx.AsyncClient(timeout=12, follow_redirects=True) as c:
+                        r = await c.get(f"https://docs.google.com/document/d/{m.group(1)}/export?format=txt")
+                        if r.status_code == 200 and r.text.strip():
+                            text, ctype = r.text, "artigo"
+            if not text:
+                async with httpx.AsyncClient(timeout=12, follow_redirects=True) as c:
+                    r = await c.get(url, headers={"User-Agent": _BROWSER_UA, "Accept-Language": "pt-BR,pt,en"})
+                    html = r.text[:500000]
+                    text = _html_to_text(html)
+                    if len(text) < 200:   # corpo raso (página JS/paywall) → OG salva algo
+                        og = _og_text(html)
+                        if len(og) > len(text):
+                            text = og
+                    if len(text) < 60:    # última carta: UA de crawler (paywalls servem OG)
+                        r2 = await c.get(url, headers={"User-Agent": _CRAWLER_UA})
+                        alt = _og_text(r2.text[:300000]) or _html_to_text(r2.text[:300000])
+                        if len(alt) > len(text):
+                            text = alt
+                if ctype == "web":
+                    if any(s in low for s in ("medium.", "substack", "/blog", "/article", "news", "dev.to")):
+                        ctype = "artigo"
+                    elif social:
+                        ctype = "post"
     except Exception:
         pass
     text = (text or "").strip()[:8000]
@@ -1727,7 +1898,7 @@ async def _enrich_link(link_id: str, user_id: str):
     content = doc.get("contentText")
     ctype = doc.get("contentType")
     words = doc.get("contentWords")
-    if content is None:   # extrai uma vez (depois fica salvo)
+    if not content:   # nunca extraiu OU ficou vazio (re-tenta: extratores melhoram)
         content, ctype, words = await _extract_content(doc.get("url", ""), doc.get("platform", ""), doc.get("videoId", ""))
     snippet = (content or "")[:1500]
     topics = await _ai_tags(title + (("\n" + snippet) if snippet else ""))
@@ -1757,7 +1928,7 @@ async def _enrich_link(link_id: str, user_id: str):
     # (carregam o MINUTO → o RAG cita "aos 12:30"); artigo → chunks por sentença.
     # SEMPRE inclui um chunk-meta (idx 0) com título+categoria+tags+plataforma —
     # garante que TODO link exista no Q&A, até TikTok/Instagram sem texto extraível.
-    if doc.get("chunksVer") != 2:
+    if doc.get("chunksVer") != 3:
         vid = doc.get("videoId", "")
         if vid:
             segs = await _yt_transcript_segments(vid)
@@ -1777,12 +1948,12 @@ async def _enrich_link(link_id: str, user_id: str):
                     await db.chunks.delete_many({"linkId": link_id, "userId": user_id})
                     await db.chunks.insert_many(rows)
                     updates["chunksAt"] = datetime.utcnow()
-                    updates["chunksVer"] = 2
+                    updates["chunksVer"] = 3
                 except Exception:
                     pass
         else:
             updates["chunksAt"] = datetime.utcnow()
-            updates["chunksVer"] = 2   # sem nada p/ indexar → não fica re-tentando
+            updates["chunksVer"] = 3   # sem nada p/ indexar → não fica re-tentando
     try:
         await db.links.update_one({"_id": doc["_id"], "userId": user_id},
                                   {"$set": updates, "$inc": {"aiTries": 1}})
@@ -2764,8 +2935,8 @@ async def ai_backfill(background: BackgroundTasks, user=Depends(get_current_user
         return {"ok": False, "reason": "no_key", "remaining": 0}
     uid = str(user["_id"])
     q = {"userId": uid, "$and": [
-        {"$or": [{"aiEnrichedAt": {"$exists": False}}, {"topicEmbedding": {"$exists": False}}, {"contentText": {"$exists": False}}, {"aiSummary": {"$exists": False}}, {"chunksVer": {"$ne": 2}}]},
-        {"$or": [{"aiTries": {"$exists": False}}, {"aiTries": {"$lt": 3}}]},
+        {"$or": [{"aiEnrichedAt": {"$exists": False}}, {"topicEmbedding": {"$exists": False}}, {"contentText": {"$exists": False}}, {"aiSummary": {"$exists": False}}, {"chunksVer": {"$ne": 3}}]},
+        {"$or": [{"aiTries": {"$exists": False}}, {"aiTries": {"$lt": 6}}]},
     ]}
     remaining = await db.links.count_documents(q)
     pending = await db.links.find(q).limit(40).to_list(40)   # lote por chamada (extração é mais pesada)
@@ -2812,10 +2983,58 @@ async def _yt_duration(video_id: str):
 @limiter.limit("20/minute")
 async def fetch_metadata(request: Request, body: dict):
     """Fetch title + thumbnail for any URL (bypasses CORS for frontend)."""
-    url = body.get("url", "")
+    url = _unwrap_url(body.get("url", ""))
     if not url:
         raise HTTPException(status_code=400, detail="URL obrigatória")
-    
+    low = url.lower()
+
+    # TikTok oEmbed → título vira "autor: legenda" (em vez de "TikTok - Make Your Day")
+    if "tiktok.com" in low:
+        try:
+            async with httpx.AsyncClient(timeout=8, follow_redirects=True) as c:
+                r = await c.get("https://www.tiktok.com/oembed", params={"url": url})
+                if r.status_code == 200:
+                    d = r.json()
+                    author = (d.get("author_name") or "").strip()
+                    cap = (d.get("title") or "").strip()
+                    title = (f"{author}: {cap}" if author and cap else cap or author)[:160]
+                    if title:
+                        return {"title": title, "thumbnail": d.get("thumbnail_url", ""),
+                                "description": cap[:500], "platform": "tiktok", "author": author}
+        except Exception:
+            pass
+
+    # X/Twitter oEmbed → texto do post como título/descrição
+    if "twitter.com" in low or "://x.com" in low:
+        try:
+            async with httpx.AsyncClient(timeout=8, follow_redirects=True) as c:
+                r = await c.get("https://publish.twitter.com/oembed",
+                                params={"url": url, "omit_script": "1", "lang": "pt"})
+                if r.status_code == 200:
+                    d = r.json()
+                    txt = _re.sub(r"\s+", " ", _re.sub(r"<[^>]+>", " ", d.get("html") or "")).strip()
+                    author = (d.get("author_name") or "").strip()
+                    if txt:
+                        return {"title": (f"{author}: {txt}" if author else txt)[:160],
+                                "thumbnail": "", "description": txt[:500],
+                                "platform": "twitter", "author": author}
+        except Exception:
+            pass
+
+    # Vimeo oEmbed
+    if "vimeo.com" in low:
+        try:
+            async with httpx.AsyncClient(timeout=8, follow_redirects=True) as c:
+                r = await c.get("https://vimeo.com/api/oembed.json", params={"url": url})
+                if r.status_code == 200:
+                    d = r.json()
+                    return {"title": d.get("title", ""), "thumbnail": d.get("thumbnail_url", ""),
+                            "description": (d.get("description") or "")[:500],
+                            "platform": "vimeo", "author": d.get("author_name", ""),
+                            "durationSeconds": d.get("duration")}
+        except Exception:
+            pass
+
     # YouTube oEmbed
     if "youtube.com" in url or "youtu.be" in url:
         try:
@@ -2837,10 +3056,10 @@ async def fetch_metadata(request: Request, body: dict):
         except:
             pass
     
-    # Generic Open Graph fallback
+    # Generic Open Graph fallback (UA de navegador real — bots declarados são barrados)
     try:
         async with httpx.AsyncClient(timeout=8, follow_redirects=True) as c:
-            r = await c.get(url, headers={"User-Agent": "WatchListBot/1.0"})
+            r = await c.get(url, headers={"User-Agent": _BROWSER_UA, "Accept-Language": "pt-BR,pt,en"})
             html = r.text[:50000]
             
             def og(prop):

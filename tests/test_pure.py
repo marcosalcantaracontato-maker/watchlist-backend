@@ -225,3 +225,40 @@ def test_parse_playlist_page():
 def test_parse_playlist_garbage():
     assert server._parse_playlist_page("") == []
     assert server._parse_playlist_page("<html>not a playlist</html>") == []
+
+
+# ── extração por plataforma (helpers puros) ───────────────────────────────────
+def test_unwrap_url_google_redirect():
+    u = "https://www.google.com/url?q=https%3A%2F%2Fexemplo.com%2Fpost&sa=D"
+    assert server._unwrap_url(u) == "https://exemplo.com/post"
+
+def test_unwrap_url_facebook_and_passthrough():
+    u = "https://l.facebook.com/l.php?u=https%3A%2F%2Fblog.com%2Fa"
+    assert server._unwrap_url(u) == "https://blog.com/a"
+    assert server._unwrap_url("https://site.com/x?q=1") == "https://site.com/x?q=1"
+    assert server._unwrap_url("") == ""
+
+def test_og_text_extracts_title_and_description():
+    html = ('<meta property="og:title" content="T&iacute;tulo Bonito"/>'
+            '<meta property="og:description" content="Uma descri&ccedil;&atilde;o."/>'
+            '<meta name="description" content="Uma descri&ccedil;&atilde;o."/>')
+    out = server._og_text(html)
+    assert "Título Bonito" in out
+    assert out.count("Uma descrição.") == 1   # dedup
+
+def test_og_text_empty():
+    assert server._og_text("") == ""
+    assert server._og_text("<html><body>nada</body></html>") == ""
+
+def test_tiktok_page_text_extracts_embedded_json():
+    html = ('{"user":{"nickname":"\uc11c\uc5f0","signature":"daily vlogs"},'
+            '"itemList":[{"desc":"@_sxxxyeon_ 346.4k seguidores - v\u00eddeos incr\u00edveis"},'
+            '{"desc":"@_sxxxyeon_ 346.4k seguidores - v\u00eddeos incr\u00edveis"}]}')
+    out = server._tiktok_page_text(html)
+    assert "서연" in out
+    assert "daily vlogs" in out
+    assert out.count("346.4k seguidores") == 1   # dedup
+
+def test_tiktok_page_text_empty():
+    assert server._tiktok_page_text("") == ""
+    assert server._tiktok_page_text("<html>nada</html>") == ""
