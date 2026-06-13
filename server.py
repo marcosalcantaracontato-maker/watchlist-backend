@@ -1955,7 +1955,8 @@ async def _enrich_link(link_id: str, user_id: str):
         content, ctype, words = await _extract_content(doc.get("url", ""), doc.get("platform", ""), doc.get("videoId", ""))
     snippet = (content or "")[:1500]
     topics = await _ai_tags(title + (("\n" + snippet) if snippet else ""))
-    emb = await _ai_embedding((title + "\n" + (content or "")).strip())
+    # Não re-embeda quem já tem vetor → re-tentativa (ex.: completar tags) fica barata.
+    emb = doc.get("topicEmbedding") or await _ai_embedding((title + "\n" + (content or "")).strip())
     updates = {
         "aiEnrichedAt": datetime.utcnow(),
         "contentText": content or "",
@@ -3077,7 +3078,7 @@ async def ai_backfill(background: BackgroundTasks, user=Depends(get_current_user
         return {"ok": False, "reason": "no_key", "remaining": 0}
     uid = str(user["_id"])
     q = {"userId": uid, "$and": [
-        {"$or": [{"aiEnrichedAt": {"$exists": False}}, {"topicEmbedding": {"$exists": False}}, {"contentText": {"$exists": False}}, {"aiSummary": {"$exists": False}}, {"chunksVer": {"$ne": 3}}]},
+        {"$or": [{"aiEnrichedAt": {"$exists": False}}, {"topicEmbedding": {"$exists": False}}, {"contentText": {"$exists": False}}, {"aiSummary": {"$exists": False}}, {"chunksVer": {"$ne": 3}}, {"aiTopics.0": {"$exists": False}}]},
         {"$or": [{"aiTries": {"$exists": False}}, {"aiTries": {"$lt": 6}}]},
     ]}
     remaining = await db.links.count_documents(q)
