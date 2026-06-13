@@ -419,6 +419,7 @@ class TeachReq(BaseModel):
 
 class AskReq(BaseModel):
     q: str = ""
+    history: list = []   # [{"q": "...", "a": "..."}] — turnos anteriores (memória do chat)
 
 class RulesReq(BaseModel):
     rules: list = []
@@ -2729,35 +2730,44 @@ async def ai_ask(req: AskReq, user=Depends(get_current_user)):
                 shown_items += 1
     struct_text = "\n".join(struct)[:6000]
 
-    # ── CONTEÚDO relevante: embedding sobre chunks (com timestamp) + notas ─────
+    # ── Montagem das FONTES (numeradas e DEDUPADAS por link) ──────────────────
     blocks, sources, seen = [], [], set()
+    def _add_link(d, body="", t=None):
+        did = str(d["_id"])
+        if did in seen:
+            return
+        seen.add(did)
+        i = len(blocks) + 1
+        head = d.get("title") or d.get("url", "")
+        cn = cname.get(d.get("categoryId") or "", "")
+        meta = head + (f" · Categoria: {cn}" if cn else "") + (f" · {d.get('platform')}" if d.get("platform") and d["platform"] != "other" else "")
+        stamp = f" (aos {int(t)//60}:{int(t)%60:02d})" if isinstance(t, (int, float)) else ""
+        blocks.append(f"[{i}] {meta}{stamp}" + (f"\n{body[:800]}" if body else ""))
+        sources.append(_src(d, int(t) if isinstance(t, (int, float)) else None))
+
+    # 1) PRIORIDADE: itens das categorias CITADAS na pergunta (é o que ele pediu)
+    for cid in mentioned:
+        for it in by_cat.get(cid, [])[:8]:
+            _add_link(it, (it.get("aiSummary") or "")[:300])
+
+    # 2) CONTEÚDO relevante por embedding (chunks com timestamp) — 1 fonte por link
     emb = await _ai_embedding(q)
     if emb:
         cvecs = await db.chunks.find({"userId": uid}, {"embedding": 1, "linkId": 1}).to_list(20000)
         csims = sorted(((_cosine(emb, c.get("embedding")), c) for c in cvecs), key=lambda x: -x[0])
-        per_link, picked = {}, []
+        ldocs = {str(d["_id"]): d for d in links}
+        added = 0
         for s, c in csims:
-            if s < 0.22 or len(picked) >= 8:
+            if s < 0.22 or added >= 8:
                 break
-            if per_link.get(c["linkId"], 0) >= 2:
+            if c["linkId"] in seen:
                 continue
-            per_link[c["linkId"]] = per_link.get(c["linkId"], 0) + 1
-            picked.append((s, c))
-        if picked:
-            chunk_full = {c["_id"]: c for c in await db.chunks.find(
-                {"_id": {"$in": [c["_id"] for _, c in picked]}}, {"text": 1, "t": 1, "linkId": 1}).to_list(len(picked))}
-            ldocs = {str(d["_id"]): d for d in links}
-            for s, c in picked:
-                ch = chunk_full.get(c["_id"]) or {}
-                ld = ldocs.get(c["linkId"])
-                if not ld:
-                    continue
-                t = ch.get("t")
-                stamp = f" (aos {int(t)//60}:{int(t)%60:02d})" if isinstance(t, (int, float)) else ""
-                i = len(blocks) + 1
-                blocks.append(f"[{i}] {ld.get('title','')}{stamp}\n{(ch.get('text') or '')[:800]}".strip())
-                sources.append(_src(ld, int(t) if isinstance(t, (int, float)) else None))
-                seen.add(str(ld["_id"]))
+            ld = ldocs.get(c["linkId"])
+            if not ld:
+                continue
+            ch = await db.chunks.find_one({"_id": c["_id"]}, {"text": 1, "t": 1})
+            _add_link(ld, (ch or {}).get("text", ""), (ch or {}).get("t"))
+            added += 1
         # notas do próprio usuário
         nvecs = await db.notes.find({"userId": uid, "noteEmbedding": {"$exists": True}, "deletedAt": None},
                                     {"noteEmbedding": 1}).to_list(4000)
@@ -2769,38 +2779,36 @@ async def ai_ask(req: AskReq, user=Depends(get_current_user)):
             sources.append({"kind": "note", "id": str(n["_id"]), "title": n.get("title") or "Sua nota",
                             "url": "", "thumb": "", "videoId": "", "t": None})
 
-    # itens das categorias citadas entram como fontes (mesmo sem match de conteúdo)
-    for cid in mentioned:
-        for it in by_cat.get(cid, [])[:8]:
-            if str(it["_id"]) not in seen:
-                seen.add(str(it["_id"]))
-                i = len(blocks) + 1
-                blocks.append(f"[{i}] {(it.get('title') or it.get('url',''))}"
-                               + (f" · Categoria: {cname.get(cid,'')}" if cname.get(cid) else "")
-                               + (f" · {it.get('platform')}" if it.get('platform') and it['platform'] != 'other' else ""))
-                sources.append(_src(it))
-
     content_text = ("\n\n".join(blocks))[:7000] if blocks else "(nenhum trecho de conteúdo recuperado)"
+
+    # Memória do chat: turnos anteriores (a IA junta a pergunta nova com o contexto)
+    hist = ""
+    for turn in (req.history or [])[-4:]:
+        uq = str(turn.get("q", ""))[:300]
+        ua = str(turn.get("a", ""))[:600]
+        if uq:
+            hist += f"\nUsuário: {uq}\nVocê: {ua}"
 
     prompt = (
         f"Você é o assistente pessoal do segundo cérebro de {uname or 'do usuário'} — inteligente, "
         "direto e perspicaz, como o ChatGPT/Claude, mas que CONHECE a biblioteca dele. Responda em "
         "português, de forma natural e útil (sem ser robótico).\n\n"
         "COMO USAR O CONTEXTO:\n"
-        "• Perguntas de ORGANIZAÇÃO (quantas/quais categorias, o que está na categoria X, em que "
-        "plataforma, quantos itens) → responda pela ESTRUTURA DA BIBLIOTECA. Ela é a verdade completa "
-        "sobre o acervo; pode contar e listar com confiança.\n"
-        "• Perguntas de CONTEÚDO (o que aprendi sobre X, resuma, sobre o que fala tal vídeo) → use os "
-        "TRECHOS DE CONTEÚDO e CITE as fontes com [n]. Quando um trecho tiver tempo ('aos 12:30'), "
-        "mencione — dá pra abrir o vídeo ali.\n"
-        "• Para LOCALIZAR algo ('qual vídeo de X', 'onde salvei Y') → cruze estrutura + trechos e "
-        "aponte o item mais provável citando [n], aceitando correspondência parcial. Só diga que não "
-        "achou se realmente não houver candidato plausível.\n"
-        "• NÃO invente conteúdo que não está no acervo, mas seja proativo: sugira o caminho, a "
-        "categoria ou o item mais próximo.\n\n"
+        "• Esta é uma CONVERSA: se houver histórico abaixo, leve-o em conta — uma mensagem curta nova "
+        "geralmente COMPLEMENTA a pergunta anterior (ex.: depois de 'vídeos da categoria W' o usuário "
+        "digita 'a asiática' → ele quer refinar a MESMA busca, não começar outra).\n"
+        "• Perguntas de ORGANIZAÇÃO (quantas/quais categorias, o que está na categoria X, plataforma, "
+        "quantos itens) → responda pela ESTRUTURA DA BIBLIOTECA (verdade completa; conte e liste com "
+        "confiança).\n"
+        "• Perguntas de CONTEÚDO (o que aprendi sobre X, resuma) → use os TRECHOS e CITE com [n]. "
+        "Trecho com tempo ('aos 12:30') → mencione.\n"
+        "• LOCALIZAR algo → cruze estrutura + trechos, aponte o item mais provável citando [n], aceite "
+        "correspondência parcial. Só diga que não achou se realmente não houver candidato.\n"
+        "• NÃO invente conteúdo fora do acervo, mas seja proativo: sugira o item/categoria mais próximo.\n\n"
         f"=== ESTRUTURA DA BIBLIOTECA ===\n{struct_text}\n\n"
-        f"=== TRECHOS DE CONTEÚDO (fontes citáveis) ===\n{content_text}\n\n"
-        f"PERGUNTA: {q}"
+        f"=== TRECHOS DE CONTEÚDO (fontes citáveis) ===\n{content_text}\n"
+        + (f"\n=== CONVERSA ATÉ AGORA ==={hist}\n" if hist else "")
+        + f"\nPERGUNTA ATUAL: {q}"
     )
     try:
         answer = await asyncio.wait_for(_chat(prompt, 900, temperature=0.35, models=GEMINI_SMART_MODELS), 30)
