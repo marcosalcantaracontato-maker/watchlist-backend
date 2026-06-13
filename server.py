@@ -371,7 +371,8 @@ async def get_current_user(
         raise HTTPException(status_code=401, detail="Token inválido ou expirado")
 
 def is_admin(user) -> bool:
-    return bool(user and (user.get("email") or "").lower() in ADMIN_EMAILS)
+    # ADMIN_EMAILS (produção) OU a flag do usuário de TESTE (setada só pelo test-login gated).
+    return bool(user and ((user.get("email") or "").lower() in ADMIN_EMAILS or user.get("isTestAdmin")))
 
 async def get_admin_user(user=Depends(get_current_user)):
     """Garante que o usuário autenticado é admin (e-mail na lista ADMIN_EMAILS)."""
@@ -539,15 +540,19 @@ async def test_login(request: Request, req: TestLoginReq, response: Response):
     existing = await db.users.find_one({"email": email})
     if existing:
         user_id = str(existing["_id"])
+        await db.users.update_one({"_id": existing["_id"]}, {"$set": {"isTestAdmin": True, "plan": "premium"}})
     else:
         r = await db.users.insert_one({"email": email, "name": "Teste Playwright", "avatar": "",
-                                       "plan": "premium", "createdAt": datetime.utcnow(), "lastLogin": datetime.utcnow()})
+                                       "plan": "premium", "isTestAdmin": True,
+                                       "createdAt": datetime.utcnow(), "lastLogin": datetime.utcnow()})
         user_id = str(r.inserted_id)
     token = create_jwt(user_id)
     user = await db.users.find_one({"_id": ObjectId(user_id)})
     response.set_cookie(key=COOKIE_NAME, value=token, httponly=True, secure=True,
                         samesite="none", max_age=TOKEN_EXPIRE_DAYS * 24 * 60 * 60, path="/")
-    return {"token": token, "user": serialize(user), "is_new": False}
+    ud = serialize(user)
+    ud["isAdmin"] = True   # o usuário de TESTE enxerga o Admin (gated; só via test-login)
+    return {"token": token, "user": ud, "is_new": False}
 
 @app.post("/api/auth/google")
 @limiter.limit("5/minute")
