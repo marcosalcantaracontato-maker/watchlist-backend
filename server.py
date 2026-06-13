@@ -2014,6 +2014,14 @@ async def _enrich_link(link_id: str, user_id: str):
                                   {"$set": updates, "$inc": {"aiTries": 1}})
     except Exception:
         pass
+    # Save AVULSO sem categoria → categoriza agora (1 chamada). Itens de PLAYLIST
+    # (importBatch) NÃO entram aqui: vão pelo lote do backfill (mais barato).
+    has_cat = updates.get("categoryId") or doc.get("categoryId")
+    if not has_cat and not doc.get("importBatch") and _ai_enabled():
+        try:
+            await _auto_categorize_pending(user_id)
+        except Exception:
+            pass
 
 @app.get("/api/ai/status")
 @limiter.limit("10/minute")
