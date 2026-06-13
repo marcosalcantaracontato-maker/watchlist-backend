@@ -1156,7 +1156,10 @@ async def update_link(link_id: str, body: LinkUpdate, user=Depends(get_current_u
         updates["watchedAt"] = datetime.utcnow()
     elif body.watched is False:
         updates["watchedAt"] = None
-    
+    # Mudou a categoria à mão → protege do automático (não será re-organizado sozinho).
+    if "categoryId" in updates:
+        updates["manualCat"] = True
+
     result = await db.links.find_one_and_update(
         {"_id": ObjectId(link_id), "userId": str(user["_id"])},
         {"$set": updates},
@@ -3012,11 +3015,19 @@ async def _auto_categorize_pending(uid: str, limit: int = 12) -> int:
         return 0
     # Só categoriza itens JÁ enriquecidos (têm resumo/temas) → qualidade alta E a barra
     # de "Categorias" anda junto com a leitura, em vez de ficar parada até o fim.
+    # NUNCA toca no que o usuário organizou à mão (manualCat) — é automático.
     items = await db.links.find(
         {"userId": uid, "autoCatAt": {"$exists": False}, "aiEnrichedAt": {"$exists": True},
+         "manualCat": {"$ne": True},
          "$or": [{"categoryId": None}, {"categoryId": {"$exists": False}}, {"categoryId": ""}]},
         {"title": 1, "platform": 1, "aiSummary": 1, "aiTopics": 1, "url": 1}).limit(limit).to_list(limit)
-    if not items:
+    return await _categorize_and_apply(uid, items, reorg=False)
+
+async def _categorize_and_apply(uid: str, items: list, reorg: bool = False) -> int:
+    """Núcleo compartilhado: a IA decide o caminho de categoria de CADA item (reusa/cria
+    aninhado) e aplica. reorg=True = re-organização explícita (itens já têm categoria;
+    pode MOVER pro lugar melhor/mais fundo). Usado pelo automático e pelos botões."""
+    if not items or not _ai_enabled():
         return 0
     _by, paths, counts = await _cat_paths(uid)
     tree = "\n".join(f"- {p}  ({counts.get(cid, 0)} itens)" for cid, p in sorted(paths.items(), key=lambda x: x[1]) if p) or "(você ainda não tem categorias)"
@@ -3045,6 +3056,9 @@ async def _auto_categorize_pending(uid: str, limit: int = 12) -> int:
         "('IA' e 'Inteligência Artificial' devem ser UMA só).\n"
         "5) Se um item for ambíguo/genérico demais pra classificar bem, devolva path: [] (deixa sem "
         "categoria — melhor vazio que errado).\n"
+        + ("6) Estes itens JÁ estão categorizados — você está RE-ORGANIZANDO a pedido do usuário. "
+           "Mova cada um para o lugar MELHOR/mais profundo (ex.: tirar de uma pilha grande e pôr numa "
+           "subcategoria de gênero). Se já estiver no lugar ideal, repita o mesmo caminho.\n" if reorg else "")
         + _rules_block(await _get_org_rules(uid)) +
         f"\nCATEGORIAS EXISTENTES (caminho · contagem):\n{tree}\n\n"
         f"ITENS A CLASSIFICAR:\n{lst}\n\n"
@@ -3063,7 +3077,10 @@ async def _auto_categorize_pending(uid: str, limit: int = 12) -> int:
             assigned[a["i"]] = [str(x) for x in a["path"] if str(x).strip()]
     done = 0
     for i, it in enumerate(items):
-        upd = {"autoCatAt": datetime.utcnow()}   # marca como tentado (não reprocessa sempre)
+        upd = {"autoCatAt": datetime.utcnow()}   # marca como processado pela IA
+        if reorg:
+            upd["manualCat"] = False        # reorganizado pela IA a pedido → volta a ser "da IA"
+            upd["reorgAt"] = datetime.utcnow()   # marca p/ não reprocessar no mesmo lote
         path = assigned.get(i)
         if path:
             cid = await _resolve_path(uid, path)
@@ -3072,6 +3089,62 @@ async def _auto_categorize_pending(uid: str, limit: int = 12) -> int:
                 done += 1
         await db.links.update_one({"_id": it["_id"], "userId": uid}, {"$set": upd})
     return done
+
+async def _descendant_cat_ids(uid: str, root_id: str) -> list:
+    """IDs da categoria + todas as subcategorias (recursivo)."""
+    cats = await db.categories.find({"userId": uid}, {"parentId": 1}).to_list(3000)
+    children = {}
+    for c in cats:
+        children.setdefault(str(c["parentId"]) if c.get("parentId") else None, []).append(str(c["_id"]))
+    out, stack = [], [root_id]
+    while stack:
+        cid = stack.pop()
+        out.append(cid)
+        stack.extend(children.get(cid, []))
+    return out
+
+class ReorgReq(BaseModel):
+    categoryId: str = ""
+
+@app.post("/api/ai/reorganize-category")
+async def reorganize_category(req: ReorgReq, user=Depends(get_current_user)):
+    """Botão por categoria (opt-in): a IA re-avalia e move os itens DESTA categoria
+    (e subcategorias) pro melhor lugar/mais fundo — inclui itens manuais, pois é
+    explícito. Processa um lote por chamada (marca reorgAt); devolve `remaining`."""
+    uid = str(user["_id"])
+    if not _ai_enabled():
+        return {"ok": False, "remaining": 0}
+    if not req.categoryId:
+        return {"ok": False, "remaining": 0}
+    cat_ids = await _descendant_cat_ids(uid, req.categoryId)
+    cutoff = datetime.utcnow() - timedelta(hours=1)
+    q = {"userId": uid, "categoryId": {"$in": cat_ids},
+         "$or": [{"reorgAt": {"$exists": False}}, {"reorgAt": {"$lt": cutoff}}]}
+    remaining = await db.links.count_documents(q)
+    items = await db.links.find(q, {"title": 1, "platform": 1, "aiSummary": 1, "aiTopics": 1, "url": 1}).limit(12).to_list(12)
+    done = await _categorize_and_apply(uid, items, reorg=True)
+    return {"ok": True, "done": done, "remaining": max(0, remaining - len(items))}
+
+@app.post("/api/ai/recategorize/{link_id}")
+async def recategorize_one(link_id: str, user=Depends(get_current_user)):
+    """3 pontinhos do item: a IA re-avalia ESTE item e o move pro melhor lugar."""
+    uid = str(user["_id"])
+    if not _ai_enabled():
+        raise HTTPException(status_code=400, detail="IA não configurada")
+    try:
+        item = await db.links.find_one({"_id": ObjectId(link_id), "userId": uid},
+            {"title": 1, "platform": 1, "aiSummary": 1, "aiTopics": 1, "url": 1})
+    except Exception:
+        item = None
+    if not item:
+        raise HTTPException(status_code=404, detail="Item não encontrado")
+    await _categorize_and_apply(uid, [item], reorg=True)
+    fresh = await db.links.find_one({"_id": ObjectId(link_id), "userId": uid}, {"categoryId": 1})
+    cat = ""
+    if fresh and fresh.get("categoryId"):
+        c = await db.categories.find_one({"_id": ObjectId(fresh["categoryId"]), "userId": uid}, {"name": 1})
+        cat = (c or {}).get("name", "")
+    return {"ok": True, "categoryId": (fresh or {}).get("categoryId"), "category": cat}
 
 @app.post("/api/ai/backfill")
 async def ai_backfill(background: BackgroundTasks, user=Depends(get_current_user)):
