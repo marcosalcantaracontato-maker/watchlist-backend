@@ -226,6 +226,27 @@ def test_parse_playlist_garbage():
     assert server._parse_playlist_page("") == []
     assert server._parse_playlist_page("<html>not a playlist</html>") == []
 
+def test_parse_playlist_rss_extracts_entries():
+    xml = ('<feed><entry><yt:videoId>dQw4w9WgXcQ</yt:videoId>'
+           '<title>Primeiro &amp; melhor</title></entry>'
+           '<entry><yt:videoId>abcdefghijk</yt:videoId><title>Segundo</title></entry></feed>')
+    out = server._parse_playlist_rss(xml)
+    assert out == [{"videoId": "dQw4w9WgXcQ", "title": "Primeiro & melhor"},
+                   {"videoId": "abcdefghijk", "title": "Segundo"}]
+
+def test_parse_playlist_rss_dedups_and_skips_entries_without_id():
+    xml = ('<entry><yt:videoId>dQw4w9WgXcQ</yt:videoId><title>A</title></entry>'
+           '<entry><yt:videoId>dQw4w9WgXcQ</yt:videoId><title>dup</title></entry>'
+           '<entry><title>sem id — ignorado</title></entry>')
+    out = server._parse_playlist_rss(xml)
+    assert [v["videoId"] for v in out] == ["dQw4w9WgXcQ"]
+
+def test_parse_playlist_rss_default_title_and_garbage():
+    out = server._parse_playlist_rss("<entry><yt:videoId>abcdefghijk</yt:videoId></entry>")
+    assert out == [{"videoId": "abcdefghijk", "title": "Vídeo do YouTube"}]
+    assert server._parse_playlist_rss("") == []
+    assert server._parse_playlist_rss("<feed>nada</feed>") == []
+
 
 # ── extração por plataforma (helpers puros) ───────────────────────────────────
 def test_unwrap_url_google_redirect():
