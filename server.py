@@ -3838,7 +3838,15 @@ async def import_bulk(request: Request, req: BulkImportReq, user=Depends(get_cur
                                 headers={"User-Agent": _BROWSER_UA, "Accept-Language": "pt-BR,pt,en",
                                          "Cookie": "CONSENT=YES+1"})
                 vids = _parse_playlist_page(r.text)[:200]
-                if not vids:   # consent/região/formato → tenta o feed RSS (público)
+                if not vids:
+                    # Mix/Rádio (RD…), 'Curtidos' (LL), 'Assistir mais tarde' (WL): a PÁGINA não
+                    # lista os vídeos (são dinâmicos/personalizados/logados). NÃO usar RSS aqui —
+                    # ele devolve ~15 vídeos enganosos (relacionados ao seed, não a fila do Mix),
+                    # o que mascarava o problema ("playlist de 25 importa 15"). Avisa de verdade.
+                    if list_id.startswith(("RD", "LL", "WL", "UL")):
+                        return {"ok": True, "found": 0, "imported": 0, "skipped": 0, "isMix": True,
+                                "reason": "Isso é um Mix/Rádio do YouTube (ou 'Curtidos'/'Assistir mais tarde'), não uma playlist de verdade — os vídeos são gerados na hora e exigem login, então não dá pra importar de fora. Salve o vídeo sozinho, ou use uma playlist pública (URL com list=PL…)."}
+                    # Playlist NORMAL que a página não listou (consentimento/região/formato) → RSS best-effort
                     rss = await c.get(f"https://www.youtube.com/feeds/videos.xml?playlist_id={list_id}")
                     if rss.status_code == 200:
                         vids = _parse_playlist_rss(rss.text)
