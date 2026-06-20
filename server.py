@@ -1030,6 +1030,50 @@ async def nuke_all_categories(request: Request, user=Depends(get_current_user)):
     print(f"[NUKE] user={uid} apagou {r.deleted_count} categorias")
     return {"ok": True, "deleted": r.deleted_count}
 
+@app.post("/api/categories/cleanup")
+@limiter.limit("6/hour")
+async def cleanup_categories(request: Request, user=Depends(get_current_user)):
+    """Conserta o lixo deixado pela corrida antiga: (1) JUNTA categorias duplicadas (mesmo
+    pai + mesmo nome, case-insensitive) — mantém a mais antiga, move os links e subcategorias
+    das cópias pra ela e apaga as cópias; (2) apaga as categorias VAZIAS criadas pela IA
+    (autoCreated, sem links e sem subcategorias). NUNCA apaga categoria feita à mão nem
+    categoria com conteúdo. Idempotente — pode rodar quantas vezes quiser."""
+    uid = str(user["_id"])
+    cats = await db.categories.find({"userId": uid}).to_list(5000)
+
+    # (1) junta duplicadas por (parentId, nome minúsculo)
+    groups: dict = {}
+    for c in cats:
+        key = (str(c.get("parentId") or ""), (c.get("name") or "").strip().lower())
+        groups.setdefault(key, []).append(c)
+    merged = 0
+    for grp in groups.values():
+        if len(grp) < 2:
+            continue
+        grp.sort(key=lambda c: c.get("createdAt") or datetime.min)   # mantém a mais antiga
+        keeper_id = str(grp[0]["_id"])
+        for dup in grp[1:]:
+            dup_id = str(dup["_id"])
+            if dup_id == keeper_id:
+                continue
+            await db.links.update_many({"userId": uid, "categoryId": dup_id}, {"$set": {"categoryId": keeper_id}})
+            await db.categories.update_many({"userId": uid, "parentId": dup_id}, {"$set": {"parentId": keeper_id}})
+            await db.categories.delete_one({"_id": dup["_id"]})
+            merged += 1
+
+    # (2) apaga as vazias criadas pela IA (sem links e sem subcategorias)
+    deleted_empty = 0
+    for c in await db.categories.find({"userId": uid, "autoCreated": True}).to_list(5000):
+        cid = str(c["_id"])
+        has_link = await db.links.find_one({"userId": uid, "categoryId": cid}, {"_id": 1})
+        has_child = await db.categories.find_one({"userId": uid, "parentId": cid}, {"_id": 1})
+        if not has_link and not has_child:
+            await db.categories.delete_one({"_id": c["_id"]})
+            deleted_empty += 1
+
+    print(f"[CLEANUP] user={uid} merged={merged} deletedEmpty={deleted_empty}")
+    return {"ok": True, "merged": merged, "deletedEmpty": deleted_empty}
+
 @app.delete("/api/categories/{cat_id}")
 async def delete_category(cat_id: str, user=Depends(get_current_user)):
     uid = str(user["_id"])
@@ -3043,6 +3087,18 @@ async def _resolve_path(uid: str, names: list) -> str:
         parent = leaf
     return leaf or ""
 
+_autocat_locks: dict = {}
+def _autocat_lock(uid: str) -> asyncio.Lock:
+    """Lock POR USUÁRIO da auto-categorização. Sem ele, duas rodadas simultâneas (backfill
+    periódico + import, que rodam em background) caem juntas no _resolve_path e criam a MESMA
+    categoria 2x (corrida check-then-insert) → categorias duplicadas e vazias. Uma rodada por
+    usuário de cada vez elimina a corrida."""
+    lk = _autocat_locks.get(uid)
+    if lk is None:
+        lk = asyncio.Lock()
+        _autocat_locks[uid] = lk
+    return lk
+
 async def _auto_categorize_pending(uid: str, limit: int = 12) -> int:
     """B (automático, alta qualidade): pega itens SEM categoria e, EM LOTE, decide o
     melhor caminho de categoria pra cada um — reusando os existentes ou criando novos
@@ -3050,15 +3106,19 @@ async def _auto_categorize_pending(uid: str, limit: int = 12) -> int:
     decidir item a item). Itens ambíguos ficam sem categoria (não geram lixo)."""
     if not _ai_enabled():
         return 0
-    # Só categoriza itens JÁ enriquecidos (têm resumo/temas) → qualidade alta E a barra
-    # de "Categorias" anda junto com a leitura, em vez de ficar parada até o fim.
-    # NUNCA toca no que o usuário organizou à mão (manualCat) — é automático.
-    items = await db.links.find(
-        {"userId": uid, "autoCatAt": {"$exists": False}, "aiEnrichedAt": {"$exists": True},
-         "manualCat": {"$ne": True},
-         "$or": [{"categoryId": None}, {"categoryId": {"$exists": False}}, {"categoryId": ""}]},
-        {"title": 1, "platform": 1, "aiSummary": 1, "aiTopics": 1, "url": 1}).limit(limit).to_list(limit)
-    return await _categorize_and_apply(uid, items, reorg=False)
+    lock = _autocat_lock(uid)
+    if lock.locked():
+        return 0   # já há uma rodada deste usuário em curso → não empilha nem arrisca corrida
+    async with lock:
+        # Só categoriza itens JÁ enriquecidos (têm resumo/temas) → qualidade alta E a barra
+        # de "Categorias" anda junto com a leitura, em vez de ficar parada até o fim.
+        # NUNCA toca no que o usuário organizou à mão (manualCat) — é automático.
+        items = await db.links.find(
+            {"userId": uid, "autoCatAt": {"$exists": False}, "aiEnrichedAt": {"$exists": True},
+             "manualCat": {"$ne": True},
+             "$or": [{"categoryId": None}, {"categoryId": {"$exists": False}}, {"categoryId": ""}]},
+            {"title": 1, "platform": 1, "aiSummary": 1, "aiTopics": 1, "url": 1}).limit(limit).to_list(limit)
+        return await _categorize_and_apply(uid, items, reorg=False)
 
 async def _categorize_and_apply(uid: str, items: list, reorg: bool = False) -> int:
     """Núcleo compartilhado: a IA decide o caminho de categoria de CADA item (reusa/cria
