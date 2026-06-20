@@ -3836,6 +3836,36 @@ def _parse_mix_watch(html: str) -> list:
         out.append({"videoId": mv.group(1), "title": title or "Vídeo do YouTube"})
     return out
 
+_YT_INNERTUBE_KEY = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8"   # chave pública WEB do YouTube
+async def _yt_mix_innertube(c, video_id: str, list_id: str) -> list:
+    """Fila do Mix/Rádio via API interna do YouTube (youtubei/v1/next): JSON robusto que
+    TOLERA IP de datacenter (o scraping do HTML do /watch é bot-bloqueado no servidor — por
+    isso voltava vazio em produção). Devolve [{videoId, title}] da fila inteira (~25)."""
+    body = {"context": {"client": {"clientName": "WEB", "clientVersion": "2.20240606.06.00",
+                                    "hl": "pt", "gl": "BR"}},
+            "videoId": video_id, "playlistId": list_id}
+    try:
+        r = await c.post(f"https://www.youtube.com/youtubei/v1/next?key={_YT_INNERTUBE_KEY}&prettyPrint=false",
+                         json=body, headers={"User-Agent": _BROWSER_UA, "Content-Type": "application/json",
+                                             "Accept-Language": "pt-BR,pt,en"})
+        data = r.json()
+    except Exception:
+        return []
+    pl = (((data.get("contents") or {}).get("twoColumnWatchNextResults") or {}).get("playlist") or {}).get("playlist") or {}
+    out, seen = [], set()
+    for it in (pl.get("contents") or []):
+        rend = it.get("playlistPanelVideoRenderer")
+        if not rend:
+            continue
+        vid = rend.get("videoId")
+        if not vid or vid in seen:
+            continue
+        seen.add(vid)
+        t = rend.get("title") or {}
+        title = t.get("simpleText") or ((t.get("runs") or [{}])[0].get("text") if t.get("runs") else "")
+        out.append({"videoId": vid, "title": title or "Vídeo do YouTube"})
+    return out
+
 class BulkImportReq(BaseModel):
     kind: str = "bookmarks"           # bookmarks | playlist
     url: str = ""                     # playlist do YouTube (?list=)
@@ -3859,12 +3889,15 @@ async def import_bulk(request: Request, req: BulkImportReq, user=Depends(get_cur
         try:
             async with httpx.AsyncClient(timeout=15, follow_redirects=True) as c:
                 if list_id.startswith("RD"):
-                    # Mix/Rádio: a FILA está na página /watch (não em /playlist). Pega o seed do
-                    # v= da URL, ou do próprio id (RD<seed>), e lê os ~25 da fila inicial.
+                    # Mix/Rádio: a FILA vem da API interna (next) — robusta no servidor. Pega o
+                    # seed do v= da URL, ou do próprio id (RD<seed>).
                     vm = _re.search(r"[?&]v=([A-Za-z0-9_-]{11})", req.url or "")
                     seed = vm.group(1) if vm else (list_id[2:13] if len(list_id) >= 13 else "")
-                    w = await c.get(f"https://www.youtube.com/watch?v={seed}&list={list_id}", headers=hdrs)
-                    vids = _parse_mix_watch(w.text)[:200]
+                    vids = await _yt_mix_innertube(c, seed, list_id)
+                    if not vids:   # fallback: HTML do /watch (casos em que a API falha)
+                        w = await c.get(f"https://www.youtube.com/watch?v={seed}&list={list_id}", headers=hdrs)
+                        vids = _parse_mix_watch(w.text)
+                    vids = vids[:200]
                 else:
                     r = await c.get(f"https://www.youtube.com/playlist?list={list_id}", headers=hdrs)
                     vids = _parse_playlist_page(r.text)[:200]
