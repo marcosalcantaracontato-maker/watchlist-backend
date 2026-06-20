@@ -3767,9 +3767,13 @@ def _parse_playlist_page(html: str) -> list:
             seen.add(vid)
             out.append({"videoId": vid, "title": (title or "").strip() or "Vídeo do YouTube"})
 
-    # Novo: contentId (vídeo) + label de acessibilidade logo em seguida
+    # Novo (lockup): 1) mapeia videoId -> título quando a label aparece perto; 2) garante que
+    # TODO vídeo do lockup entre, mesmo se a label não casou (antes alguns sumiam quando a label
+    # ficava longe → "playlist de 100 mas faltam alguns"). Na página /playlist os lockups de
+    # VÍDEO são os da própria playlist (sem recomendações), então é seguro pegar todos.
+    titles = {}
     for m in _re.finditer(
-        r'"contentId":"([A-Za-z0-9_-]{11})","contentType":"LOCKUP_CONTENT_TYPE_VIDEO".{0,400}?'
+        r'"contentId":"([A-Za-z0-9_-]{11})","contentType":"LOCKUP_CONTENT_TYPE_VIDEO".{0,1200}?'
         r'"accessibilityContext":\{"label":"((?:[^"\\]|\\.)*)"', html, _re.S):
         try:
             label = _json.loads(f'"{m.group(2)}"')
@@ -3777,8 +3781,12 @@ def _parse_playlist_page(html: str) -> list:
             label = m.group(2)
         # tira o sufixo de duração ("3 minutos e 55 segundos" / "3 minutes, 55 seconds")
         title = _re.sub(r"\s+\d+\s+(hora|minuto|segundo|hour|minute|second)s?\b.*$", "", label).strip()
-        _push(m.group(1), title or label)
-    if out:
+        titles.setdefault(m.group(1), title or label)
+    saw_lockup = False
+    for m in _re.finditer(r'"contentId":"([A-Za-z0-9_-]{11})","contentType":"LOCKUP_CONTENT_TYPE_VIDEO"', html):
+        saw_lockup = True
+        _push(m.group(1), titles.get(m.group(1)))
+    if saw_lockup:
         return out
 
     # Antigo: playlistVideoRenderer com title.runs
