@@ -3813,6 +3813,29 @@ def _parse_playlist_rss(xml: str) -> list:
         out.append({"videoId": mv.group(1), "title": title or "Vídeo do YouTube"})
     return out
 
+def _parse_mix_watch(html: str) -> list:
+    """Mix/Rádio (list=RD…) NÃO aparece em /playlist (é dinâmico). Mas a FILA inicial (~25)
+    vem no HTML da página /watch?v=…&list=RD…, em blocos playlistPanelVideoRenderer. Aqui
+    extraímos videoId (confiável) + título (label de acessibilidade, tirando a duração).
+    Pula itens de UI (sem duração/lengthText). Puro."""
+    out, seen = [], set()
+    for blk in (html or "").split('"playlistPanelVideoRenderer"')[1:]:
+        mv = _re.search(r'"videoId":"([A-Za-z0-9_-]{11})"', blk)
+        if not mv or mv.group(1) in seen:
+            continue
+        if '"lengthText"' not in blk[:1800]:   # item de vídeo de verdade tem duração
+            continue
+        seen.add(mv.group(1))
+        ml = _re.search(r'"accessibility":\{"accessibilityData":\{"label":"((?:[^"\\]|\\.)*)"', blk)
+        label = ml.group(1) if ml else ""
+        try:
+            label = _json.loads(f'"{label}"')
+        except Exception:
+            pass
+        title = _re.sub(r"\s+\d+\s+(hora|minuto|segundo|hour|minute|second)s?\b.*$", "", label).strip()
+        out.append({"videoId": mv.group(1), "title": title or "Vídeo do YouTube"})
+    return out
+
 class BulkImportReq(BaseModel):
     kind: str = "bookmarks"           # bookmarks | playlist
     url: str = ""                     # playlist do YouTube (?list=)
@@ -3831,34 +3854,38 @@ async def import_bulk(request: Request, req: BulkImportReq, user=Depends(get_cur
         if not m:
             raise HTTPException(status_code=400, detail="URL de playlist inválida (precisa conter ?list=)")
         list_id = m.group(1)
+        hdrs = {"User-Agent": _BROWSER_UA, "Accept-Language": "pt-BR,pt,en", "Cookie": "CONSENT=YES+1"}
         vids = []
         try:
             async with httpx.AsyncClient(timeout=15, follow_redirects=True) as c:
-                r = await c.get(f"https://www.youtube.com/playlist?list={list_id}",
-                                headers={"User-Agent": _BROWSER_UA, "Accept-Language": "pt-BR,pt,en",
-                                         "Cookie": "CONSENT=YES+1"})
-                vids = _parse_playlist_page(r.text)[:200]
-                if not vids:
-                    # Mix/Rádio (RD…), 'Curtidos' (LL), 'Assistir mais tarde' (WL): a PÁGINA não
-                    # lista os vídeos (são dinâmicos/personalizados/logados). NÃO usar RSS aqui —
-                    # ele devolve ~15 vídeos enganosos (relacionados ao seed, não a fila do Mix),
-                    # o que mascarava o problema ("playlist de 25 importa 15"). Avisa de verdade.
-                    if list_id.startswith(("RD", "LL", "WL", "UL")):
-                        return {"ok": True, "found": 0, "imported": 0, "skipped": 0, "isMix": True,
-                                "reason": "Isso é um Mix/Rádio do YouTube (ou 'Curtidos'/'Assistir mais tarde'), não uma playlist de verdade — os vídeos são gerados na hora e exigem login, então não dá pra importar de fora. Salve o vídeo sozinho, ou use uma playlist pública (URL com list=PL…)."}
-                    # Playlist NORMAL que a página não listou (consentimento/região/formato) → RSS best-effort
-                    rss = await c.get(f"https://www.youtube.com/feeds/videos.xml?playlist_id={list_id}")
-                    if rss.status_code == 200:
-                        vids = _parse_playlist_rss(rss.text)
+                if list_id.startswith("RD"):
+                    # Mix/Rádio: a FILA está na página /watch (não em /playlist). Pega o seed do
+                    # v= da URL, ou do próprio id (RD<seed>), e lê os ~25 da fila inicial.
+                    vm = _re.search(r"[?&]v=([A-Za-z0-9_-]{11})", req.url or "")
+                    seed = vm.group(1) if vm else (list_id[2:13] if len(list_id) >= 13 else "")
+                    w = await c.get(f"https://www.youtube.com/watch?v={seed}&list={list_id}", headers=hdrs)
+                    vids = _parse_mix_watch(w.text)[:200]
+                else:
+                    r = await c.get(f"https://www.youtube.com/playlist?list={list_id}", headers=hdrs)
+                    vids = _parse_playlist_page(r.text)[:200]
+                    if not vids:
+                        # 'Curtidos' (LL) e 'Assistir mais tarde' (WL) são privados → exigem login.
+                        if list_id.startswith(("LL", "WL", "UL")):
+                            return {"ok": True, "found": 0, "imported": 0, "skipped": 0, "isMix": True,
+                                    "reason": "'Curtidos' e 'Assistir mais tarde' são privados (exigem login) — não dá pra importar de fora. Salve os vídeos sozinhos ou use uma playlist pública (list=PL…)."}
+                        # Playlist normal que a página não listou (consentimento/região) → RSS best-effort
+                        rss = await c.get(f"https://www.youtube.com/feeds/videos.xml?playlist_id={list_id}")
+                        if rss.status_code == 200:
+                            vids = _parse_playlist_rss(rss.text)
         except Exception:
-            raise HTTPException(status_code=502, detail="Não consegui ler a playlist agora")
+            raise HTTPException(status_code=502, detail="Não consegui ler a playlist/mix agora")
         items = [{"url": f"https://www.youtube.com/watch?v={v['videoId']}", "title": v["title"],
                   "videoId": v["videoId"]} for v in vids]
         if not items:
-            # Conseguiu acessar mas não listou vídeos → provável playlist privada, Mix/rádio
-            # (list=RD…), "Curtidos"/"Assistir mais tarde" (exigem login) ou vazia.
+            # Nem a playlist nem a fila do Mix expuseram vídeos → privada, ou Mix que não trouxe
+            # a fila desta vez, ou vazia.
             return {"ok": True, "found": 0, "imported": 0, "skipped": 0,
-                    "reason": "Não consegui ler os vídeos — playlists privadas, Mix/rádio (RD…), 'Curtidos' ou 'Assistir mais tarde' exigem login e não dá para importar de fora. Use uma playlist pública."}
+                    "reason": "Não consegui ler os vídeos desta vez. Playlists privadas e 'Curtidos'/'Assistir mais tarde' exigem login. Se for um Mix, tente de novo a partir da página do vídeo (com a fila aberta), ou use uma playlist pública (list=PL…)."}
     else:
         items = [{"url": b["url"], "title": b["title"], "videoId": _yt_video_id(b["url"])}
                  for b in _parse_bookmarks_html(req.html or "")[:500]]
