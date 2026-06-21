@@ -157,6 +157,12 @@ async def _gemini_chat(prompt: str, max_tokens: int, temperature: float = 0.3, t
 # Modelos para DECISÕES que exigem nuance (categoria/tags sugeridas ao usuário):
 # começa por um modelo mais forte e cai pros menores. Dedup com a lista padrão.
 GEMINI_SMART_MODELS = list(dict.fromkeys(["gemini-2.5-flash", "gemini-2.0-flash"] + GEMINI_CHAT_MODELS))
+# MELHOR modelo p/ tags+categorias (precisão/coesão): lidera com gemini-2.5-pro (o mais
+# capaz do Gemini). Se a cota do Pro estourar, o _gemini_chat cai sozinho pro 2.5-flash etc.
+# Configurável por env. Usado em: _ai_tags (temas), suggest-tags, suggest-category e a
+# auto-categorização em lote (_categorize_and_apply).
+GEMINI_BEST_MODELS = list(dict.fromkeys(
+    [os.getenv("GEMINI_BEST_MODEL", "gemini-2.5-pro")] + GEMINI_SMART_MODELS))
 
 def _groq_keys_available(model: str) -> list:
     today = datetime.utcnow().strftime("%Y-%m-%d")
@@ -1594,7 +1600,7 @@ async def _ai_tags(title: str) -> list:
     if not title or not _ai_enabled():
         return []
     try:
-        txt = await _chat(f"{_TAG_SYS}\n\nTítulo: {title}", 200, temperature=0.2, timeout=25)
+        txt = await _chat(f"{_TAG_SYS}\n\nTítulo: {title}", 200, temperature=0.2, timeout=40, models=GEMINI_BEST_MODELS)
         return _extract_tags(txt) if txt else []
     except Exception:
         return []
@@ -2347,7 +2353,7 @@ async def suggest_category(req: SuggestCatReq, user=Depends(get_current_user)):
         f"CONTEÚDO:\nTítulo: {title}\nURL: {(req.url or '')[:200]}\n"
         + (f"Descrição: {desc}\n" if desc else "")
     )
-    txt = await _chat(prompt, 260, temperature=0.2, models=GEMINI_SMART_MODELS)
+    txt = await _chat(prompt, 260, temperature=0.2, models=GEMINI_BEST_MODELS)
     out = {"matchId": None, "newName": None, "newParentId": None, "reason": ""}
     try:
         m = _re.search(r"\{.*\}", txt, _re.S)
@@ -2392,7 +2398,7 @@ async def suggest_tags(req: SuggestTagsReq, user=Depends(get_current_user)):
         f"Título: {title}\nURL: {(req.url or '')[:200]}\n"
         + (f"Descrição: {desc}\n" if desc else "")
     )
-    txt = await _chat(prompt, 140, temperature=0.3, models=GEMINI_SMART_MODELS)
+    txt = await _chat(prompt, 140, temperature=0.3, models=GEMINI_BEST_MODELS)
     tags = []
     try:
         m = _re.search(r"\[.*\]", txt, _re.S)
@@ -3163,7 +3169,7 @@ async def _categorize_and_apply(uid: str, items: list, reorg: bool = False) -> i
         "Use exatamente os nomes dos caminhos existentes quando reutilizar."
     )
     try:
-        txt = await asyncio.wait_for(_chat(prompt, 1200, temperature=0.2, models=GEMINI_SMART_MODELS), 40)
+        txt = await asyncio.wait_for(_chat(prompt, 1200, temperature=0.2, models=GEMINI_BEST_MODELS), 60)
         m = _re.search(r"\[.*\]", txt, _re.S)
         arr = _json.loads(m.group(0)) if m else []
     except Exception:
