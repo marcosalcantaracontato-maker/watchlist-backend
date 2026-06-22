@@ -3119,9 +3119,13 @@ async def _auto_categorize_pending(uid: str, limit: int = 12) -> int:
         # Só categoriza itens JÁ enriquecidos (têm resumo/temas) → qualidade alta E a barra
         # de "Categorias" anda junto com a leitura, em vez de ficar parada até o fim.
         # NUNCA toca no que o usuário organizou à mão (manualCat) — é automático.
+        # Pega itens enriquecidos, SEM categoria, não-manuais e que a IA ainda NÃO marcou como
+        # ambíguos. Não filtra por autoCatAt → re-pega os que ficaram presos (autoCatAt setado
+        # por uma falha antiga, mas sem categoria). Categorizado sai pelo categoryId; ambíguo
+        # sai pela flag → sem loop.
         items = await db.links.find(
-            {"userId": uid, "autoCatAt": {"$exists": False}, "aiEnrichedAt": {"$exists": True},
-             "manualCat": {"$ne": True},
+            {"userId": uid, "aiEnrichedAt": {"$exists": True},
+             "manualCat": {"$ne": True}, "catAmbiguous": {"$ne": True},
              "$or": [{"categoryId": None}, {"categoryId": {"$exists": False}}, {"categoryId": ""}]},
             {"title": 1, "platform": 1, "aiSummary": 1, "aiTopics": 1, "url": 1}).limit(limit).to_list(limit)
         return await _categorize_and_apply(uid, items, reorg=False)
@@ -3169,17 +3173,24 @@ async def _categorize_and_apply(uid: str, items: list, reorg: bool = False) -> i
         "Use exatamente os nomes dos caminhos existentes quando reutilizar."
     )
     try:
-        txt = await asyncio.wait_for(_chat(prompt, 1200, temperature=0.2, models=GEMINI_BEST_MODELS), 60)
+        txt = await asyncio.wait_for(_chat(prompt, 1200, temperature=0.2, models=GEMINI_BEST_MODELS), 90)
         m = _re.search(r"\[.*\]", txt, _re.S)
         arr = _json.loads(m.group(0)) if m else []
     except Exception:
         arr = []
+    if not arr:
+        # IA não respondeu (erro/timeout/parse). NÃO marca como processado → tenta de novo no
+        # próximo backfill. (Antes marcava todos e eles ficavam SEM categoria pra sempre — era
+        # por isso que "concluía" com 0 categorias.)
+        return 0
     assigned = {}
     for a in arr:
         if isinstance(a, dict) and isinstance(a.get("i"), int) and isinstance(a.get("path"), list):
             assigned[a["i"]] = [str(x) for x in a["path"] if str(x).strip()]
     done = 0
     for i, it in enumerate(items):
+        if i not in assigned:
+            continue   # a IA não decidiu este item neste lote → deixa p/ a próxima rodada
         upd = {"autoCatAt": datetime.utcnow()}   # marca como processado pela IA
         if reorg:
             upd["manualCat"] = False        # reorganizado pela IA a pedido → volta a ser "da IA"
@@ -3189,7 +3200,12 @@ async def _categorize_and_apply(uid: str, items: list, reorg: bool = False) -> i
             cid = await _resolve_path(uid, path)
             if cid:
                 upd["categoryId"] = cid
+                upd["catAmbiguous"] = False
                 done += 1
+        else:
+            # IA decidiu que é ambíguo/genérico demais (path: []). Marca a flag p/ NÃO ficar
+            # reprocessando à toa, mas o item segue sem categoria (melhor vazio que errado).
+            upd["catAmbiguous"] = True
         await db.links.update_one({"_id": it["_id"], "userId": uid}, {"$set": upd})
     return done
 
