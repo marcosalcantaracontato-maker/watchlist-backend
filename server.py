@@ -3127,7 +3127,7 @@ async def _auto_categorize_pending(uid: str, limit: int = 12) -> int:
             {"userId": uid, "aiEnrichedAt": {"$exists": True},
              "manualCat": {"$ne": True}, "catAmbiguous": {"$ne": True},
              "$or": [{"categoryId": None}, {"categoryId": {"$exists": False}}, {"categoryId": ""}]},
-            {"title": 1, "platform": 1, "aiSummary": 1, "aiTopics": 1, "url": 1}).limit(limit).to_list(limit)
+            {"title": 1, "platform": 1, "aiSummary": 1, "aiTopics": 1, "url": 1, "catTries": 1}).limit(limit).to_list(limit)
         return await _categorize_and_apply(uid, items, reorg=False)
 
 async def _categorize_and_apply(uid: str, items: list, reorg: bool = False) -> int:
@@ -3172,40 +3172,44 @@ async def _categorize_and_apply(uid: str, items: list, reorg: bool = False) -> i
         'Responda APENAS um array JSON, um objeto por item: [{"i":0,"path":["Pai","Filho"]}, ...]. '
         "Use exatamente os nomes dos caminhos existentes quando reutilizar."
     )
+    # O LOTE usa o chain RÁPIDO/CONFIÁVEL (flash). O gemini-2.5-pro aqui estava ficando lento no
+    # prompt grande do lote e, com várias chaves Gemini, ESTOURAVA o tempo → resposta vazia → a
+    # barra de "Categorias" travava em 0 e a importação não terminava nunca. O Pro segue nas
+    # SUGESTÕES interativas (1 item, prompt pequeno), onde a qualidade importa e o usuário espera.
     try:
-        txt = await asyncio.wait_for(_chat(prompt, 1200, temperature=0.2, models=GEMINI_BEST_MODELS), 90)
+        txt = await asyncio.wait_for(_chat(prompt, 1400, temperature=0.2, models=GEMINI_SMART_MODELS), 50)
         m = _re.search(r"\[.*\]", txt, _re.S)
         arr = _json.loads(m.group(0)) if m else []
     except Exception:
         arr = []
-    if not arr:
-        # IA não respondeu (erro/timeout/parse). NÃO marca como processado → tenta de novo no
-        # próximo backfill. (Antes marcava todos e eles ficavam SEM categoria pra sempre — era
-        # por isso que "concluía" com 0 categorias.)
-        return 0
     assigned = {}
     for a in arr:
         if isinstance(a, dict) and isinstance(a.get("i"), int) and isinstance(a.get("path"), list):
             assigned[a["i"]] = [str(x) for x in a["path"] if str(x).strip()]
+    now = datetime.utcnow()
     done = 0
     for i, it in enumerate(items):
-        if i not in assigned:
-            continue   # a IA não decidiu este item neste lote → deixa p/ a próxima rodada
-        upd = {"autoCatAt": datetime.utcnow()}   # marca como processado pela IA
-        if reorg:
-            upd["manualCat"] = False        # reorganizado pela IA a pedido → volta a ser "da IA"
-            upd["reorgAt"] = datetime.utcnow()   # marca p/ não reprocessar no mesmo lote
-        path = assigned.get(i)
+        path = assigned.get(i)   # None = IA não decidiu; [] = ambíguo; [..] = caminho de categoria
+        upd = None
         if path:
             cid = await _resolve_path(uid, path)
             if cid:
-                upd["categoryId"] = cid
-                upd["catAmbiguous"] = False
+                upd = {"autoCatAt": now, "categoryId": cid, "catAmbiguous": False}
+                if reorg:
+                    upd["manualCat"] = False         # reorganizado pela IA a pedido → volta a ser "da IA"
+                    upd["reorgAt"] = now             # marca p/ não reprocessar no mesmo lote
                 done += 1
-        else:
-            # IA decidiu que é ambíguo/genérico demais (path: []). Marca a flag p/ NÃO ficar
-            # reprocessando à toa, mas o item segue sem categoria (melhor vazio que errado).
-            upd["catAmbiguous"] = True
+        elif i in assigned:
+            upd = {"autoCatAt": now, "catAmbiguous": True}   # IA disse ambíguo → sem categoria, mas PROCESSADO
+        if upd is None:
+            # IA não decidiu este item (resposta vazia/incompleta ou _resolve_path falhou). Conta a
+            # tentativa e, após 3, DESISTE (marca processado) p/ a importação CONCLUIR em vez de
+            # travar pra sempre. ESSA é a proteção contra a barra que nunca terminava.
+            tries = (it.get("catTries") or 0) + 1
+            upd = {"catTries": tries}
+            if tries >= 3:
+                upd["autoCatAt"] = now
+                upd["catAmbiguous"] = True
         await db.links.update_one({"_id": it["_id"], "userId": uid}, {"$set": upd})
     return done
 
