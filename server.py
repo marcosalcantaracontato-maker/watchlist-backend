@@ -3897,6 +3897,7 @@ class BulkImportReq(BaseModel):
     url: str = ""                     # playlist do YouTube (?list=)
     html: str = ""                    # conteúdo do arquivo de bookmarks
     categoryId: Optional[str] = None
+    confirmMix: bool = False          # reimportar um Mix (rádio) já importado só com confirmação explícita
 
 @app.post("/api/import/bulk")
 @limiter.limit("10/hour")
@@ -3905,11 +3906,13 @@ async def import_bulk(request: Request, req: BulkImportReq, user=Depends(get_cur
     Dedup contra o acervo, respeita o limite do plano free. O enriquecimento de IA
     acontece pelo backfill normal (lotes em background) — nada trava aqui."""
     uid = str(user["_id"])
+    mix_id = None   # se for Mix/Rádio (list=RD…), guarda o id p/ marcar os docs e detectar reimport
     if req.kind == "playlist":
         m = _re.search(r"[?&]list=([A-Za-z0-9_-]+)", req.url or "")
         if not m:
             raise HTTPException(status_code=400, detail="URL de playlist inválida (precisa conter ?list=)")
         list_id = m.group(1)
+        mix_id = list_id if list_id.startswith("RD") else None
         hdrs = {"User-Agent": _BROWSER_UA, "Accept-Language": "pt-BR,pt,en", "Cookie": "CONSENT=YES+1"}
         vids = []
         try:
@@ -3969,7 +3972,7 @@ async def import_bulk(request: Request, req: BulkImportReq, user=Depends(get_cur
             break
         docs.append({
             "userId": uid, "url": it["url"], "urlKey": ukey, "title": (it["title"] or it["url"])[:300],
-            "thumbnail": "", "rawThumb": "", "importBatch": batch,
+            "thumbnail": "", "rawThumb": "", "importBatch": batch, "importMix": mix_id,
             "platform": "youtube" if it["videoId"] else "other",
             "videoId": it["videoId"] or "", "categoryId": cat,
             "watched": False, "notes": "", "tags": [], "order": 0,
@@ -3980,6 +3983,17 @@ async def import_bulk(request: Request, req: BulkImportReq, user=Depends(get_cur
         if it["videoId"]:
             have_v.add(it["videoId"])
         have_k.add(ukey)
+    # Mix/Rádio (RD…) é um rádio INFINITO: cada importação traz vídeos DIFERENTES (não os mesmos).
+    # Se o usuário JÁ importou este Mix, não empilha de novo sem querer — devolve um aviso e só
+    # prossegue com confirmação explícita (confirmMix). Não há duplicata real (o dedup por videoId
+    # barra os repetidos); o "problema" é o rádio trazer sempre vídeos novos a cada vez.
+    if mix_id and not req.confirmMix:
+        # already = docs marcados com este Mix (confiável p/ imports feitos a partir de agora).
+        # skipped>=5 = muita sobreposição com o acervo → cobre Mixes importados ANTES desta marca.
+        already = await db.links.count_documents({"userId": uid, "importMix": mix_id})
+        if already > 0 or skipped >= 5:
+            return {"ok": True, "alreadyImportedMix": True, "mixCount": already or skipped,
+                    "wouldAdd": len(docs), "skipped": skipped, "found": len(items)}
     if docs:
         await db.links.insert_many(docs)
     return {"ok": True, "found": len(items), "imported": len(docs), "skipped": skipped,
