@@ -4014,8 +4014,14 @@ async def import_progress(batch: str = "", user=Depends(get_current_user)):
     categorized = await db.links.count_documents({**base, "categoryId": {"$nin": [None, ""]}})
     cat_done = await db.links.count_documents({**base, "autoCatAt": {"$exists": True}})
     done = total > 0 and enriched >= total and cat_done >= total
+    # Item "lido agora": o mais recém-enriquecido do lote → alimenta o HERO da extensão
+    # (título + thumbnail do vídeo que a IA acabou de ler).
+    cur = await db.links.find_one(
+        {**base, "aiEnrichedAt": {"$exists": True}},
+        {"title": 1, "videoId": 1}, sort=[("aiEnrichedAt", -1)])
+    current = {"title": cur.get("title", ""), "videoId": cur.get("videoId", "")} if cur else None
     return {"total": total, "enriched": enriched, "tagged": tagged,
-            "categorized": categorized, "catProcessed": cat_done, "done": done}
+            "categorized": categorized, "catProcessed": cat_done, "done": done, "current": current}
 
 @app.post("/api/migrate")
 @limiter.limit("3/hour")
