@@ -1657,50 +1657,6 @@ async def categorize_suggest(body: CategorizeReq, user=Depends(get_current_user)
     await asyncio.gather(*[_work(d) for d in docs])
     return {"suggestions": out}
 
-# ── IA: gerar FLASHCARDS (Q/A) a partir de título+notas+resumo (só gera, o app guarda) ──
-_FC_SYS = ("Você cria FLASHCARDS de estudo a partir das notas/resumo de um vídeo. Gere de 3 a 6 "
-           "cartões objetivos. Responda APENAS um array JSON de objetos {\"q\":\"pergunta\",\"a\":"
-           "\"resposta curta\"}, sem texto extra, em português.")
-
-def _extract_cards(txt: str) -> list:
-    m = _re.search(r"\[.*\]", txt or "", _re.S)
-    if not m:
-        return []
-    try:
-        arr = _json.loads(m.group(0))
-        out = []
-        for it in arr:
-            q = str(it.get("q", "")).strip()
-            a = str(it.get("a", "")).strip()
-            if q and a:
-                out.append({"q": q[:300], "a": a[:600]})
-        return out[:8]
-    except Exception:
-        return []
-
-class FlashReq(BaseModel):
-    linkId: str = ""
-
-@app.post("/api/flashcards/generate")
-async def flashcards_generate(body: FlashReq, user=Depends(get_current_user)):
-    """Gera flashcards (Q/A) do vídeo (título+notas+resumo). NÃO grava — o app guarda/agenda."""
-    uid = str(user["_id"])
-    if not body.linkId or not _ai_enabled():
-        return {"cards": []}
-    try:
-        doc = await db.links.find_one({"userId": uid, "_id": ObjectId(body.linkId)}, {"title": 1, "notes": 1, "aiSummary": 1})
-    except Exception:
-        doc = None
-    if not doc:
-        return {"cards": []}
-    ctx = (f"Título: {doc.get('title','')}\n\nNotas: {doc.get('notes','') or '(sem notas)'}\n\n"
-           f"Resumo: {doc.get('aiSummary','') or '(sem resumo)'}")
-    try:
-        txt = await _chat(f"{_FC_SYS}\n\n{ctx[:4000]}", 700, temperature=0.3, timeout=40, models=GEMINI_SMART_MODELS)
-        return {"cards": _extract_cards(txt) if txt else []}
-    except Exception:
-        return {"cards": []}
-
 async def _ai_embedding(text: str):
     if not text or not _ai_enabled():
         return None
