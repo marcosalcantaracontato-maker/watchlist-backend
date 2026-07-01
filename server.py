@@ -1605,6 +1605,58 @@ async def _ai_tags(title: str) -> list:
     except Exception:
         return []
 
+# ── IA: sugerir a melhor CATEGORIA existente p/ um vídeo (só sugere, não grava) ──
+_CAT_SYS = ("Você classifica um vídeo em UMA categoria existente. Dada a lista de categorias "
+            "e o título, responda APENAS o nome EXATO de uma categoria da lista (copie igual), "
+            "ou a palavra NENHUMA se nada servir bem. Sem texto extra.")
+
+async def _ai_categorize_one(title: str, cat_names: list) -> str:
+    if not title or not cat_names or not _ai_enabled():
+        return ""
+    lst = ", ".join(cat_names[:60])
+    try:
+        txt = await _chat(f"{_CAT_SYS}\n\nCategorias: {lst}\n\nTítulo: {title}\n\nCategoria:",
+                          40, temperature=0.0, timeout=30, models=GEMINI_SMART_MODELS)
+        if not txt:
+            return ""
+        return txt.strip().strip('"').splitlines()[0].strip()
+    except Exception:
+        return ""
+
+class CategorizeReq(BaseModel):
+    ids: List[str] = []
+
+@app.post("/api/links/categorize-suggest")
+async def categorize_suggest(body: CategorizeReq, user=Depends(get_current_user)):
+    """SÓ SUGERE (não grava): p/ cada link, a IA escolhe a melhor categoria EXISTENTE.
+    A aplicação real é o PATCH normal, após o usuário aprovar no app. Máx 40 por chamada."""
+    uid = str(user["_id"])
+    ids = list(body.ids or [])[:40]
+    if not ids:
+        return {"suggestions": {}}
+    cats = [c async for c in db.categories.find({"userId": uid}, {"name": 1})]
+    name_to_id = {(c.get("name") or "").strip().lower(): str(c["_id"]) for c in cats}
+    cat_names = [c.get("name", "") for c in cats if c.get("name")]
+    if not cat_names:
+        return {"suggestions": {}}
+    oids = []
+    for i in ids:
+        try:
+            oids.append(ObjectId(i))
+        except Exception:
+            pass
+    docs = [d async for d in db.links.find({"userId": uid, "_id": {"$in": oids}}, {"title": 1})]
+    sem = asyncio.Semaphore(4)
+    out: dict = {}
+    async def _work(d):
+        async with sem:
+            name = await _ai_categorize_one(d.get("title", ""), cat_names)
+            cid = name_to_id.get((name or "").strip().lower())
+            if cid:
+                out[str(d["_id"])] = cid
+    await asyncio.gather(*[_work(d) for d in docs])
+    return {"suggestions": out}
+
 async def _ai_embedding(text: str):
     if not text or not _ai_enabled():
         return None
